@@ -123,31 +123,33 @@ async function verifyCrispRecallLicense(licenseCode, options = {}) {
     const signatureValid = await subtle.verify("Ed25519", publicKey, signatureBuffer, dataBuffer);
     if (!signatureValid) return { valid: false, reason: "授权签名无效或伪造" };
 
-    const onlineRequest = options.request || requestUrl;
-    try {
-      const response = await onlineRequest({
-        url: CRISP_LICENSE_VERIFY_URL,
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          licenseCode: trimmed,
-          deviceId: (options.getDeviceId || getDeviceId)(),
-          action: "activate",
-          pluginId: permission.onlinePluginId,
-        }),
-      });
-      const cloudResult = response.json;
-      if (cloudResult && typeof cloudResult.valid === "boolean") {
-        if (!cloudResult.valid) {
-          return { valid: false, reason: cloudResult.reason || "设备数已达上限" };
+    if (options.online === true || typeof options.request === "function") {
+      const onlineRequest = options.request || requestUrl;
+      try {
+        const response = await onlineRequest({
+          url: CRISP_LICENSE_VERIFY_URL,
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            licenseCode: trimmed,
+            deviceId: (options.getDeviceId || getDeviceId)(),
+            action: "activate",
+            pluginId: permission.onlinePluginId,
+          }),
+        });
+        const cloudResult = response.json;
+        if (cloudResult && typeof cloudResult.valid === "boolean") {
+          if (!cloudResult.valid) {
+            return { valid: false, reason: cloudResult.reason || "设备数已达上限" };
+          }
+          return { valid: true, payload, message: cloudResult.message || null, source: "online" };
         }
-        return { valid: true, payload, message: cloudResult.message || null };
+      } catch {
+        console.debug("Crisp Recall license online check offline fallback");
       }
-    } catch {
-      console.debug("Crisp Recall license online check offline fallback");
     }
 
-    return { valid: true, payload, message: null };
+    return { valid: true, payload, message: "离线验证成功", source: "offline" };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return { valid: false, reason: `解析授权码失败：${message}` };
@@ -552,7 +554,7 @@ class CrispRecallPlugin extends Plugin {
         : "",
     });
     this.licenseState = { valid: false, payload: null, reason: "尚未输入 Crisp 授权码" };
-    await this.refreshLicenseState();
+    await this.refreshLicenseState({ online: false });
 
     // 1. Markdown Post Processor: Inline Cloze & Q&A Cards in Reading View
     this.registerMarkdownPostProcessor((element, context) => {
@@ -672,12 +674,12 @@ class CrispRecallPlugin extends Plugin {
     return false;
   }
 
-  async refreshLicenseState() {
+  async refreshLicenseState(options = {}) {
     if (!this.settings.licenseCode) {
       this.licenseState = { valid: false, payload: null, reason: "尚未输入 Crisp 授权码" };
       return this.licenseState;
     }
-    const result = await verifyCrispRecallLicense(this.settings.licenseCode);
+    const result = await verifyCrispRecallLicense(this.settings.licenseCode, options);
     this.licenseState = result.valid
       ? { valid: true, payload: result.payload, reason: null }
       : { valid: false, payload: null, reason: result.reason || "授权码无效" };
@@ -686,7 +688,7 @@ class CrispRecallPlugin extends Plugin {
 
   async activateLicense(licenseCode) {
     this.settings.licenseCode = typeof licenseCode === "string" ? licenseCode.trim() : "";
-    const state = await this.refreshLicenseState();
+    const state = await this.refreshLicenseState({ online: true });
     await this.saveSettings();
     if (state.valid) this.refreshReadingViews();
     return state;
