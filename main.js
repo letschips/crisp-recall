@@ -581,6 +581,30 @@ class CrispRecallPlugin extends Plugin {
     // 3. Add Settings Tab
     this.addSettingTab(new CrispRecallSettingTab(this.app, this));
 
+    // 4. Register Workspace events for Reactive Floating Pill Widget
+    this.registerEvent(
+      this.app.workspace.on("active-leaf-change", () => {
+        this.updateActiveLeafFloatingWidget();
+      })
+    );
+    this.registerEvent(
+      this.app.workspace.on("layout-change", () => {
+        this.updateActiveLeafFloatingWidget();
+      })
+    );
+    this.registerEvent(
+      this.app.vault.on("modify", (file) => {
+        const activeFile = this.app.workspace.getActiveFile();
+        if (activeFile && file?.path === activeFile.path) {
+          this.updateActiveLeafFloatingWidget(file.path);
+        }
+      })
+    );
+
+    this.app.workspace.onLayoutReady(() => {
+      this.updateActiveLeafFloatingWidget();
+    });
+
     console.log("⚡ Crisp Recall Plugin loaded successfully.");
   }
 
@@ -746,50 +770,103 @@ class CrispRecallPlugin extends Plugin {
 
     // Floating Pill Widget at bottom-right of preview view
     if (this.settings.enableFloatingPill) {
-      const previewView = element.closest(".markdown-preview-view");
-      const floatingHost = previewView?.closest(".workspace-leaf-content") || previewView;
-      if (floatingHost) {
-        this.injectFloatingWidget(floatingHost, context.sourcePath);
+      if (this.app.workspace?.getLeavesOfType) {
+        this.updateActiveLeafFloatingWidget();
+      } else {
+        const previewView = element.closest(".markdown-preview-view");
+        const floatingHost = previewView?.closest(".workspace-leaf-content") || previewView;
+        if (floatingHost) this.injectFloatingWidget(floatingHost, context.sourcePath);
       }
     }
   }
 
-  async injectFloatingWidget(container, sourcePath) {
+  async updateActiveLeafFloatingWidget(forceSourcePath = null) {
+    if (!this.settings.enableFloatingPill || !this.isLicenseValid()) {
+      document.querySelectorAll(".crisp-recall-floating-pill").forEach((p) => p.remove());
+      return;
+    }
+
+    const leaves = this.app.workspace?.getLeavesOfType?.("markdown") || [];
+    await Promise.all(leaves.map(async (leaf) => {
+      const view = leaf.view;
+      if (!view || !view.file) return;
+      const container = view.containerEl;
+      if (!container) return;
+
+      const isPreview = view.getMode ? view.getMode() === "preview" : true;
+      if (!isPreview) {
+        container.querySelector(".crisp-recall-floating-pill")?.remove();
+        return;
+      }
+
+      try {
+        const sourcePath = view.file.path;
+        await this.injectFloatingWidget(container, sourcePath, {
+          force: sourcePath === forceSourcePath,
+        });
+      } catch (err) {
+        console.debug("Crisp Recall floating widget update error:", err);
+      }
+    }));
+  }
+
+  async injectFloatingWidget(container, sourcePath, { force = false } = {}) {
     if (!this.isLicenseValid()) return;
+
     const existingPill = container.querySelector(".crisp-recall-floating-pill");
-    if (existingPill?.dataset.crispRecallSource === sourcePath) return;
+    if (!force && existingPill?.dataset.crispRecallSource === sourcePath) return;
 
     if (!this.floatingWidgetRequests) this.floatingWidgetRequests = new WeakMap();
+    const pendingRequest = this.floatingWidgetRequests.get(container);
+    if (!force && pendingRequest?.sourcePath === sourcePath) return;
+
     const requestToken = {};
-    this.floatingWidgetRequests.set(container, requestToken);
-    existingPill?.remove();
+    this.floatingWidgetRequests.set(container, { sourcePath, requestToken });
+    if (existingPill?.dataset.crispRecallSource !== sourcePath) existingPill?.remove();
 
-    const file = this.app.vault.getFileByPath(sourcePath);
-    if (!file) return;
+    try {
+      const file = this.app.vault.getFileByPath(sourcePath);
+      if (!file) {
+        container.querySelector(".crisp-recall-floating-pill")?.remove();
+        return;
+      }
 
-    const content = await this.app.vault.cachedRead(file);
-    if (!this.isLicenseValid()) return;
-    if (this.floatingWidgetRequests.get(container) !== requestToken) return;
-    const cards = parseFlashcardsFromText(content, sourcePath, this.settings);
-    if (cards.length === 0) return;
-    container.querySelector(".crisp-recall-floating-pill")?.remove();
+      const content = await this.app.vault.cachedRead(file);
+      if (!this.isLicenseValid()) return;
+      if (this.floatingWidgetRequests.get(container)?.requestToken !== requestToken) return;
 
-    const pill = container.createDiv("crisp-recall-floating-pill");
-    pill.dataset.crispRecallSource = sourcePath;
-    const badge = pill.createDiv("crisp-recall-pill-badge");
-    badge.createSpan({ text: "⚡ Recall" });
-    badge.createSpan({ cls: "crisp-recall-pill-count", text: `${cards.length}` });
+      const cards = parseFlashcardsFromText(content, sourcePath, this.settings);
+      if (cards.length === 0) {
+        container.querySelector(".crisp-recall-floating-pill")?.remove();
+        return;
+      }
 
-    const toggleBtn = pill.createEl("button", { cls: "crisp-recall-pill-btn", text: "👁️ 翻转全部" });
-    toggleBtn.onclick = () => this.toggleAllMasks();
+      container.querySelector(".crisp-recall-floating-pill")?.remove();
+      const pill = container.createDiv("crisp-recall-floating-pill");
+      pill.dataset.crispRecallSource = sourcePath;
+      const badge = pill.createDiv("crisp-recall-pill-badge");
+      badge.createSpan({ text: "⚡ Recall" });
+      badge.createSpan({ cls: "crisp-recall-pill-count", text: `${cards.length}` });
 
-    const reviewBtn = pill.createEl("button", {
-      cls: "crisp-recall-pill-btn crisp-recall-pill-btn--cta",
-      text: "开始抽认",
-    });
-    reviewBtn.onclick = () => {
-      this.openReviewModal(cards, file.basename);
-    };
+      const toggleBtn = pill.createEl("button", { cls: "crisp-recall-pill-btn", text: "👁️ 翻转全部" });
+      toggleBtn.onclick = (event) => {
+        event.stopPropagation();
+        this.toggleAllMasks();
+      };
+
+      const reviewBtn = pill.createEl("button", {
+        cls: "crisp-recall-pill-btn crisp-recall-pill-btn--cta",
+        text: "开始抽认",
+      });
+      reviewBtn.onclick = (event) => {
+        event.stopPropagation();
+        this.openReviewModal(cards, file.basename);
+      };
+    } finally {
+      if (this.floatingWidgetRequests.get(container)?.requestToken === requestToken) {
+        this.floatingWidgetRequests.delete(container);
+      }
+    }
   }
 
   toggleAllMasks() {
@@ -902,9 +979,6 @@ class CrispRecallSettingTab extends PluginSettingTab {
     containerEl.empty();
 
     containerEl.createEl("h2", { text: "⚡ Crisp Recall 设置" });
-    containerEl.createEl("p", {
-      text: "基于 RemNote 理念的轻量级主动回忆与 3D 闪卡复习引擎，由 letschips 独立自研。",
-    });
 
     const licenseState = this.plugin.licenseState || { valid: false, reason: "尚未输入 Crisp 授权码" };
     const statusSetting = new Setting(containerEl).setName("激活状态");

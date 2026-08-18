@@ -81,7 +81,8 @@
   position: absolute;
   right: 24px;
   bottom: 24px;
-  z-index: 100;
+  z-index: var(--layer-popover, 999);
+  pointer-events: auto;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -89,10 +90,10 @@
   border-radius: 20px;
   background: var(--background-primary-alt);
   border: 1px solid var(--background-modifier-border);
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.12), 0 2px 6px rgba(0, 0, 0, 0.08);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.16), 0 2px 6px rgba(0, 0, 0, 0.08);
   font-size: 0.85rem;
   color: var(--text-normal);
-  transition: box-shadow 0.2s ease, border-color 0.2s ease;
+  transition: box-shadow 0.2s ease, border-color 0.2s ease, transform 0.2s ease;
 }
 
 .crisp-recall-floating-pill:hover {
@@ -328,19 +329,20 @@
 .crisp-recall-grading-group {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 14px;
   width: 100%;
   justify-content: center;
 }
 
 .crisp-recall-grade-btn {
-  flex: 1;
-  max-width: 160px;
-  padding: 8px 12px;
-  border-radius: 10px;
+  flex: 0 1 148px;
+  max-width: 148px;
+  padding: 6px 10px;
+  border-radius: 9px;
   border: 1px solid var(--background-modifier-border);
   font-weight: 600;
   font-size: 0.85rem;
+  line-height: 1.15;
   cursor: pointer;
   display: flex;
   flex-direction: column;
@@ -444,7 +446,7 @@
 @media (max-width: 600px) {
   .crisp-recall-floating-pill {
     right: 12px;
-    bottom: 12px;
+    bottom: calc(72px + env(safe-area-inset-bottom, 0px));
     max-width: calc(100% - 24px);
     gap: 5px;
     padding: 5px 8px;
@@ -495,7 +497,7 @@
 
   .crisp-recall-grade-btn {
     min-width: 0;
-    padding: 8px 5px;
+    padding: 6px 4px;
     font-size: 0.76rem;
   }
 

@@ -134,6 +134,12 @@ class FakeElement {
     children.forEach((child) => this.addChild(child));
   }
 
+  empty() {
+    this.children.forEach((child) => { child.parentElement = null; });
+    this.children = [];
+    this.textContent = "";
+  }
+
   querySelector(selector) {
     const className = selector.startsWith(".") ? selector.slice(1) : null;
     if (className && this.className.split(/\s+/).includes(className)) return this;
@@ -550,6 +556,76 @@ test("floating controller refreshes when the leaf opens another note", async () 
   assert.equal(pills.length, 1);
   assert.equal(pills[0].dataset.crispRecallSource, "second.md");
   assert.equal(pills[0].querySelector(".crisp-recall-pill-count").textContent, "2");
+});
+
+test("reactive floating controller ignores a stale note read", async () => {
+  const { PluginClass } = loadPlugin();
+  const firstFile = { path: "first.md", basename: "first" };
+  const secondFile = { path: "second.md", basename: "second" };
+  let resolveFirstRead;
+  const firstRead = new Promise((resolve) => { resolveFirstRead = resolve; });
+  const container = new FakeElement("workspace-leaf-content");
+  const view = {
+    file: firstFile,
+    containerEl: container,
+    getMode: () => "preview",
+  };
+  const plugin = new PluginClass({
+    workspace: { getLeavesOfType: () => [{ view }] },
+    vault: {
+      async cachedRead(file) {
+        if (file.path === firstFile.path) return firstRead;
+        return "Second :: Answer\nAnother :: Card";
+      },
+      getFileByPath(sourcePath) {
+        return sourcePath === firstFile.path ? firstFile : secondFile;
+      },
+    },
+  });
+  plugin.settings = {
+    enableCloze: true,
+    enableDoubleColon: true,
+    enableFloatingPill: true,
+  };
+  plugin.licenseState = { valid: true, payload: { product: "Crisp Suite" } };
+
+  const staleUpdate = plugin.updateActiveLeafFloatingWidget();
+  view.file = secondFile;
+  await plugin.updateActiveLeafFloatingWidget();
+  resolveFirstRead("First :: Answer");
+  await staleUpdate;
+
+  const pills = container.querySelectorAll(".crisp-recall-floating-pill");
+  assert.equal(pills.length, 1);
+  assert.equal(pills[0].dataset.crispRecallSource, secondFile.path);
+  assert.equal(pills[0].querySelector(".crisp-recall-pill-count").textContent, "2");
+});
+
+test("floating controller retries after a temporarily unavailable file", async () => {
+  const { PluginClass } = loadPlugin();
+  const file = { path: "note.md", basename: "note" };
+  let fileAvailable = false;
+  const plugin = new PluginClass({
+    vault: {
+      getFileByPath: () => (fileAvailable ? file : null),
+      async cachedRead() {
+        return "Question :: Answer";
+      },
+    },
+  });
+  plugin.settings = {
+    enableCloze: true,
+    enableDoubleColon: true,
+    enableFloatingPill: true,
+  };
+  plugin.licenseState = { valid: true, payload: { product: "Crisp Suite" } };
+  const container = new FakeElement("workspace-leaf-content");
+
+  await plugin.injectFloatingWidget(container, file.path);
+  fileAvailable = true;
+  await plugin.injectFloatingWidget(container, file.path);
+
+  assert.equal(container.querySelectorAll(".crisp-recall-floating-pill").length, 1);
 });
 
 test("vault review scans every Markdown file, including files after the first 50", async () => {
