@@ -747,24 +747,35 @@ class CrispRecallPlugin extends Plugin {
     // Floating Pill Widget at bottom-right of preview view
     if (this.settings.enableFloatingPill) {
       const previewView = element.closest(".markdown-preview-view");
-      if (previewView && !previewView.querySelector(".crisp-recall-floating-pill")) {
-        this.injectFloatingWidget(previewView, context.sourcePath);
+      const floatingHost = previewView?.closest(".workspace-leaf-content") || previewView;
+      if (floatingHost) {
+        this.injectFloatingWidget(floatingHost, context.sourcePath);
       }
     }
   }
 
   async injectFloatingWidget(container, sourcePath) {
     if (!this.isLicenseValid()) return;
+    const existingPill = container.querySelector(".crisp-recall-floating-pill");
+    if (existingPill?.dataset.crispRecallSource === sourcePath) return;
+
+    if (!this.floatingWidgetRequests) this.floatingWidgetRequests = new WeakMap();
+    const requestToken = {};
+    this.floatingWidgetRequests.set(container, requestToken);
+    existingPill?.remove();
+
     const file = this.app.vault.getFileByPath(sourcePath);
     if (!file) return;
 
     const content = await this.app.vault.cachedRead(file);
     if (!this.isLicenseValid()) return;
+    if (this.floatingWidgetRequests.get(container) !== requestToken) return;
     const cards = parseFlashcardsFromText(content, sourcePath, this.settings);
     if (cards.length === 0) return;
-    if (container.querySelector(".crisp-recall-floating-pill")) return;
+    container.querySelector(".crisp-recall-floating-pill")?.remove();
 
     const pill = container.createDiv("crisp-recall-floating-pill");
+    pill.dataset.crispRecallSource = sourcePath;
     const badge = pill.createDiv("crisp-recall-pill-badge");
     badge.createSpan({ text: "⚡ Recall" });
     badge.createSpan({ cls: "crisp-recall-pill-count", text: `${cards.length}` });
