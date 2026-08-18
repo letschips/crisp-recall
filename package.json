@@ -1,0 +1,10 @@
+{
+  "name": "crisp-recall",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Active recall, cloze deletion, and flashcard review for Obsidian Markdown.",
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "check": "node --check main.js && npm test"
+  }
+}

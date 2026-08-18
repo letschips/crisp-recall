@@ -1,0 +1,10 @@
+{
+  "id": "crisp-recall",
+  "name": "Crisp Recall",
+  "version": "0.2.0",
+  "minAppVersion": "1.6.0",
+  "description": "Zero-friction RemNote-style active recall, cloze deletion, and Zen flashcard reviewer for Obsidian.",
+  "author": "letschips",
+  "authorUrl": "https://github.com/letschips",
+  "isDesktopOnly": false
+}
