@@ -91,22 +91,29 @@ class FakeElement {
     this.tagName = tagName.toLowerCase();
     this.children = [];
     this.attributes = {};
+    this.dataset = {};
     this.textContent = "";
+    this.parentElement = null;
+    this.closestTargets = new Map();
+  }
+
+  addChild(child) {
+    child.parentElement = this;
+    this.children.push(child);
+    return child;
   }
 
   createDiv(arg = "") {
     const className = typeof arg === "string" ? arg : arg.cls || "";
     const child = new FakeElement(className, "div");
     if (typeof arg === "object" && arg.text) child.textContent = arg.text;
-    this.children.push(child);
-    return child;
+    return this.addChild(child);
   }
 
   createSpan(arg = {}) {
     const child = new FakeElement(arg.cls || "", "span");
     if (arg.text) child.textContent = arg.text;
-    this.children.push(child);
-    return child;
+    return this.addChild(child);
   }
 
   createEl(tagName, arg = {}) {
@@ -115,8 +122,7 @@ class FakeElement {
     for (const [name, value] of Object.entries(arg.attr || {})) {
       child.setAttr(name, value);
     }
-    this.children.push(child);
-    return child;
+    return this.addChild(child);
   }
 
   setAttr(name, value) {
@@ -125,7 +131,7 @@ class FakeElement {
   }
 
   append(...children) {
-    this.children.push(...children);
+    children.forEach((child) => this.addChild(child));
   }
 
   querySelector(selector) {
@@ -137,6 +143,28 @@ class FakeElement {
       if (match) return match;
     }
     return null;
+  }
+
+  querySelectorAll(selector) {
+    const matches = [];
+    const className = selector.startsWith(".") ? selector.slice(1) : null;
+    if (className && this.className.split(/\s+/).includes(className)) matches.push(this);
+    if (!className && this.tagName === selector.toLowerCase()) matches.push(this);
+    for (const child of this.children) matches.push(...child.querySelectorAll(selector));
+    return matches;
+  }
+
+  closest(selector) {
+    if (this.closestTargets.has(selector)) return this.closestTargets.get(selector);
+    const className = selector.startsWith(".") ? selector.slice(1) : null;
+    if (className && this.className.split(/\s+/).includes(className)) return this;
+    return this.parentElement?.closest(selector) || null;
+  }
+
+  remove() {
+    if (!this.parentElement) return;
+    this.parentElement.children = this.parentElement.children.filter((child) => child !== this);
+    this.parentElement = null;
   }
 }
 
@@ -456,6 +484,72 @@ test("concurrent post-processors inject only one floating controller", async () 
     child.className.split(/\s+/).includes("crisp-recall-floating-pill")
   );
   assert.equal(pills.length, 1);
+});
+
+test("floating controller is hosted outside the scrolling preview", async () => {
+  const { PluginClass } = loadPlugin();
+  const file = { path: "note.md", basename: "note" };
+  const plugin = new PluginClass({
+    vault: {
+      getFileByPath: () => file,
+      async cachedRead() {
+        return "Remember ==answer==";
+      },
+    },
+  });
+  plugin.settings = {
+    enableCloze: true,
+    enableDoubleColon: false,
+    enableFloatingPill: true,
+  };
+  plugin.licenseState = { valid: true, payload: { product: "Crisp Suite" } };
+
+  const leafHost = new FakeElement("workspace-leaf-content");
+  const preview = leafHost.addChild(new FakeElement("markdown-preview-view"));
+  const section = preview.addChild(new FakeElement("markdown-preview-section"));
+
+  plugin.processMarkdownView(section, { sourcePath: file.path });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(preview.querySelector(".crisp-recall-floating-pill"), null);
+  assert.ok(leafHost.querySelector(".crisp-recall-floating-pill"));
+});
+
+test("floating controller refreshes when the leaf opens another note", async () => {
+  const { PluginClass } = loadPlugin();
+  const files = {
+    "first.md": { path: "first.md", basename: "first" },
+    "second.md": { path: "second.md", basename: "second" },
+  };
+  const plugin = new PluginClass({
+    vault: {
+      getFileByPath: (sourcePath) => files[sourcePath],
+      async cachedRead(file) {
+        return file.path === "first.md"
+          ? "First :: Answer"
+          : "Second :: Answer\nAnother :: Card";
+      },
+    },
+  });
+  plugin.settings = {
+    enableCloze: true,
+    enableDoubleColon: true,
+    enableFloatingPill: true,
+  };
+  plugin.licenseState = { valid: true, payload: { product: "Crisp Suite" } };
+  const leafHost = new FakeElement("workspace-leaf-content");
+  const preview = leafHost.addChild(new FakeElement("markdown-preview-view"));
+  const section = preview.addChild(new FakeElement("markdown-preview-section"));
+
+  plugin.processMarkdownView(section, { sourcePath: "first.md" });
+  await new Promise((resolve) => setImmediate(resolve));
+  plugin.processMarkdownView(section, { sourcePath: "second.md" });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const pills = leafHost.querySelectorAll(".crisp-recall-floating-pill");
+  assert.equal(pills.length, 1);
+  assert.equal(pills[0].dataset.crispRecallSource, "second.md");
+  assert.equal(pills[0].querySelector(".crisp-recall-pill-count").textContent, "2");
 });
 
 test("vault review scans every Markdown file, including files after the first 50", async () => {
