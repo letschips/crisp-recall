@@ -10,7 +10,19 @@ function loadPlugin({ document } = {}) {
   class Plugin {
     constructor(app) {
       this.app = app;
+      this.commands = [];
     }
+    registerDomEvent() {}
+    registerMarkdownPostProcessor() {}
+    registerEvent() {}
+    addCommand(cmd) {
+      this.commands.push(cmd);
+    }
+    addSettingTab() {}
+    async loadData() {
+      return {};
+    }
+    async saveData() {}
   }
   class Modal {
     constructor(app) {
@@ -651,6 +663,34 @@ test("vault review scans every Markdown file, including files after the first 50
   assert.equal(reads, 51);
 });
 
+test("handleSelectionAction wraps and unwraps cloze, or formats concept/bidirectional cards", () => {
+  const { PluginClass } = loadPlugin();
+  const plugin = new PluginClass({});
+  let replaced = "";
+  const mockEditor = {
+    getSelection: () => "Core Concept",
+    replaceSelection: (val) => {
+      replaced = val;
+    },
+    focus: () => {},
+  };
+
+  plugin.handleSelectionAction("cloze", mockEditor);
+  assert.equal(replaced, "==Core Concept==");
+
+  mockEditor.getSelection = () => "==Core Concept==";
+  plugin.handleSelectionAction("cloze", mockEditor);
+  assert.equal(replaced, "Core Concept");
+
+  mockEditor.getSelection = () => "Question";
+  plugin.handleSelectionAction("qa", mockEditor);
+  assert.equal(replaced, "Question :: ");
+
+  mockEditor.getSelection = () => "Front";
+  plugin.handleSelectionAction("bidirectional", mockEditor);
+  assert.equal(replaced, "Front ::: ");
+});
+
 test("release metadata keeps package, manifest, and minimum Obsidian version aligned", () => {
   const root = path.join(__dirname, "..");
   const manifest = JSON.parse(fs.readFileSync(path.join(root, "manifest.json"), "utf8"));
@@ -660,3 +700,4 @@ test("release metadata keeps package, manifest, and minimum Obsidian version ali
   assert.equal(packageJson.version, manifest.version);
   assert.equal(versions[manifest.version], manifest.minAppVersion);
 });
+

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.4 — 2026-08-19
+
+- 新增划词制卡悬浮微胶囊（Selection Floating Bubble）：在编辑模式划选文本时，自动在选区上方平滑浮现 Apple 风格胶囊工具栏，支持一键制作「⚡ 挖空 (`==...==`)」、「🗂️ 问答 (`::`)」与「🔄 双向 (`:::`)」闪卡。
+- 新增命令面板制卡指令：新增 `Wrap selection as Cloze`、`Make selection Q&A card` 和 `Make selection Bidirectional card` 快捷命令。
+- 修复 macOS 透明窗口 GPU 拖尾与重影：划词拖拽期间静默计算，松开鼠标瞬时精准吸附，彻底根除 macOS Chromium 合成层残影。
+- 新增独立控制开关：在「设置 ➔ Crisp Recall」中新增「启用划词制卡悬浮气泡」开关。
+
 ## 0.2.3 — 2026-08-18
 
 - 优化冷启动耗时：启动阶段切换为纯离线 WebCrypto Ed25519 签名校验（耗时 < 1ms），彻底消除远程网络握手阻塞。

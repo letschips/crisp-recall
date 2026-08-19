@@ -574,3 +574,88 @@
 .crisp-recall-about__author-link:hover {
   text-decoration: underline;
 }
+
+/* --------------------------------------------------------------------------
+ * 5. Selection Floating Bubble (Apple Glass Capsule — 0 GPU Clash)
+ * -------------------------------------------------------------------------- */
+.crisp-recall-selection-bubble {
+  position: fixed;
+  z-index: var(--layer-popover, 9999);
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px 6px;
+  border-radius: 999px;
+  background: var(--background-secondary, #222225);
+  border: 1px solid var(--background-modifier-border, rgba(255, 255, 255, 0.14));
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35), 0 0 1px rgba(255, 255, 255, 0.2) inset;
+  transform: translate(-50%, -100%);
+  opacity: 0;
+  pointer-events: none;
+  user-select: none;
+  transition: opacity 0.12s ease;
+}
+
+.theme-light .crisp-recall-selection-bubble {
+  background: var(--background-primary, #ffffff);
+  border: 1px solid var(--background-modifier-border, rgba(0, 0, 0, 0.12));
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12), 0 0 1px rgba(0, 0, 0, 0.05) inset;
+}
+
+.crisp-recall-selection-bubble.is-visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.crisp-recall-bubble-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  color: var(--text-normal, rgba(255, 255, 255, 0.9));
+  background: transparent;
+  border: none;
+  border-radius: 999px;
+  cursor: pointer;
+  white-space: nowrap;
+  line-height: 1.2;
+  transition: background 0.1s ease, color 0.1s ease;
+}
+
+.theme-light .crisp-recall-bubble-btn {
+  color: rgba(0, 0, 0, 0.85);
+}
+
+.crisp-recall-bubble-btn:hover {
+  background: var(--background-modifier-hover, rgba(255, 255, 255, 0.15));
+  color: var(--text-normal, #ffffff);
+}
+
+.theme-light .crisp-recall-bubble-btn:hover {
+  background: var(--background-modifier-hover, rgba(0, 0, 0, 0.06));
+  color: #000000;
+}
+
+.crisp-recall-bubble-btn:active {
+  background: var(--background-modifier-active-hover, rgba(255, 255, 255, 0.25));
+}
+
+.crisp-recall-bubble-icon {
+  font-size: 11px;
+  line-height: 1;
+}
+
+.crisp-recall-bubble-divider {
+  width: 1px;
+  height: 12px;
+  background: var(--background-modifier-border, rgba(255, 255, 255, 0.15));
+  margin: 0 1px;
+}
+
+.theme-light .crisp-recall-bubble-divider {
+  background: var(--background-modifier-border, rgba(0, 0, 0, 0.1));
+}
+

@@ -10,6 +10,7 @@ const DEFAULT_SETTINGS = {
   enableDoubleColon: true,
   enableCallouts: true,
   enableFloatingPill: true,
+  enableSelectionBubble: true,
   clozeDelimiter: "==",
   autoMaskInReadingView: true,
   licenseCode: "",
@@ -580,6 +581,24 @@ class CrispRecallPlugin extends Plugin {
       callback: () => this.toggleAllMasks(),
     });
 
+    this.addCommand({
+      id: "wrap-selection-cloze",
+      name: "Wrap selection as Cloze (制作挖空 ==文本==)",
+      editorCallback: (editor) => this.handleSelectionAction("cloze", editor),
+    });
+
+    this.addCommand({
+      id: "make-selection-qa",
+      name: "Make selection Q&A card (制作问答卡 ::)",
+      editorCallback: (editor) => this.handleSelectionAction("qa", editor),
+    });
+
+    this.addCommand({
+      id: "make-selection-bidirectional",
+      name: "Make selection Bidirectional card (制作双向卡 :::)",
+      editorCallback: (editor) => this.handleSelectionAction("bidirectional", editor),
+    });
+
     // 3. Add Settings Tab
     this.addSettingTab(new CrispRecallSettingTab(this.app, this));
 
@@ -602,6 +621,45 @@ class CrispRecallPlugin extends Plugin {
         }
       })
     );
+
+    // 5. Register Selection Change & Editor Events for Selection Floating Bubble
+    if (typeof document !== "undefined" && typeof this.registerDomEvent === "function") {
+      this.isPointerSelecting = false;
+
+      this.registerDomEvent(document, "pointerdown", (e) => {
+        if (this.selectionBubbleEl && this.selectionBubbleEl.contains?.(e.target)) return;
+        this.isPointerSelecting = true;
+        this.hideSelectionBubble();
+      });
+
+      this.registerDomEvent(document, "pointerup", (e) => {
+        if (this.selectionBubbleEl && this.selectionBubbleEl.contains?.(e.target)) return;
+        this.isPointerSelecting = false;
+        if (this._selectionDebounce) cancelAnimationFrame(this._selectionDebounce);
+        this._selectionDebounce = requestAnimationFrame(() => {
+          this.updateSelectionBubble();
+        });
+      });
+
+      this.registerDomEvent(document, "selectionchange", () => {
+        if (this.isPointerSelecting) return;
+        if (this._selectionDebounce) cancelAnimationFrame(this._selectionDebounce);
+        this._selectionDebounce = requestAnimationFrame(() => {
+          this.updateSelectionBubble();
+        });
+      });
+
+      this.registerDomEvent(document, "scroll", (e) => {
+        if (this.selectionBubbleEl && this.selectionBubbleEl.contains?.(e.target)) return;
+        this.hideSelectionBubble();
+      }, true);
+
+      this.registerDomEvent(document, "keydown", (e) => {
+        if (e.key === "Escape") {
+          this.hideSelectionBubble();
+        }
+      });
+    }
 
     this.app.workspace.onLayoutReady(() => {
       this.updateActiveLeafFloatingWidget();
@@ -636,7 +694,179 @@ class CrispRecallPlugin extends Plugin {
     modal.open();
   }
 
+  ensureSelectionBubble() {
+    if (this.selectionBubbleEl && this.selectionBubbleEl.isConnected) {
+      return this.selectionBubbleEl;
+    }
+    const doc = typeof document !== "undefined" ? document : null;
+    if (!doc || !doc.body) return null;
+
+    const bubble = doc.createElement("div");
+    bubble.className = "crisp-recall-selection-bubble";
+
+    const clozeBtn = bubble.createEl("button", {
+      cls: "crisp-recall-bubble-btn",
+      attr: { type: "button", title: "制作挖空 (Cloze ==文本==)" },
+    });
+    clozeBtn.innerHTML = '<span class="crisp-recall-bubble-icon">⚡</span><span>挖空</span>';
+    clozeBtn.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.handleSelectionAction("cloze");
+    });
+
+    bubble.createDiv({ cls: "crisp-recall-bubble-divider" });
+
+    const qaBtn = bubble.createEl("button", {
+      cls: "crisp-recall-bubble-btn",
+      attr: { type: "button", title: "制作问答卡 (问题 :: 答案)" },
+    });
+    qaBtn.innerHTML = '<span class="crisp-recall-bubble-icon">🗂️</span><span>问答</span>';
+    qaBtn.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.handleSelectionAction("qa");
+    });
+
+    bubble.createDiv({ cls: "crisp-recall-bubble-divider" });
+
+    const biBtn = bubble.createEl("button", {
+      cls: "crisp-recall-bubble-btn",
+      attr: { type: "button", title: "制作双向卡 (正面 ::: 背面)" },
+    });
+    biBtn.innerHTML = '<span class="crisp-recall-bubble-icon">🔄</span><span>双向</span>';
+    biBtn.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.handleSelectionAction("bidirectional");
+    });
+
+    doc.body.appendChild(bubble);
+    this.selectionBubbleEl = bubble;
+    return bubble;
+  }
+
+  getActiveEditor() {
+    const activeLeaf = this.app.workspace?.activeLeaf;
+    if (!activeLeaf || activeLeaf.view?.getViewType?.() !== "markdown") return null;
+    return activeLeaf.view.editor || null;
+  }
+
+  handleSelectionAction(action, directEditor = null) {
+    const editor = directEditor || this.getActiveEditor();
+    if (!editor) {
+      this.hideSelectionBubble();
+      return;
+    }
+    const selection = editor.getSelection?.();
+    if (!selection) {
+      this.hideSelectionBubble();
+      return;
+    }
+
+    if (action === "cloze") {
+      if (selection.startsWith("==") && selection.endsWith("==") && selection.length >= 4) {
+        editor.replaceSelection(selection.slice(2, -2));
+      } else {
+        editor.replaceSelection(`==${selection}==`);
+      }
+    } else if (action === "qa") {
+      editor.replaceSelection(`${selection} :: `);
+    } else if (action === "bidirectional") {
+      editor.replaceSelection(`${selection} ::: `);
+    }
+
+    this.hideSelectionBubble();
+    editor.focus?.();
+  }
+
+  updateSelectionBubble() {
+    if (this.isPointerSelecting) return;
+    if (!this.settings?.enableSelectionBubble) {
+      this.hideSelectionBubble();
+      return;
+    }
+    if (!this.licenseState?.valid) {
+      this.hideSelectionBubble();
+      return;
+    }
+
+    const activeLeaf = this.app.workspace?.activeLeaf;
+    if (!activeLeaf || activeLeaf.view?.getViewType?.() !== "markdown") {
+      this.hideSelectionBubble();
+      return;
+    }
+
+    const view = activeLeaf.view;
+    const mode = view.getMode?.() || view.currentMode?.type;
+    if (mode === "preview") {
+      this.hideSelectionBubble();
+      return;
+    }
+
+    const editor = view.editor;
+    if (!editor) {
+      this.hideSelectionBubble();
+      return;
+    }
+
+    const selectedText = editor.getSelection?.();
+    if (!selectedText || selectedText.trim().length === 0) {
+      this.hideSelectionBubble();
+      return;
+    }
+
+    const win = view.containerEl?.ownerDocument?.defaultView || (typeof window !== "undefined" ? window : null);
+    if (!win || typeof win.getSelection !== "function") {
+      this.hideSelectionBubble();
+      return;
+    }
+
+    const domSelection = win.getSelection();
+    if (!domSelection || domSelection.rangeCount === 0 || domSelection.isCollapsed) {
+      this.hideSelectionBubble();
+      return;
+    }
+
+    const range = domSelection.getRangeAt(0);
+    const rect = range.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) {
+      this.hideSelectionBubble();
+      return;
+    }
+
+    const bubble = this.ensureSelectionBubble();
+    if (!bubble) return;
+
+    const bubbleWidth = bubble.offsetWidth || 190;
+    const bubbleHeight = bubble.offsetHeight || 32;
+
+    let top = rect.top - 6;
+    let placeBelow = false;
+    if (rect.top - bubbleHeight - 6 < 10) {
+      top = rect.bottom + 6;
+      placeBelow = true;
+    }
+
+    let left = rect.left + rect.width / 2;
+    const minLeft = bubbleWidth / 2 + 12;
+    const maxLeft = (win.innerWidth || 1000) - bubbleWidth / 2 - 12;
+    left = Math.max(minLeft, Math.min(maxLeft, left));
+
+    bubble.style.top = `${Math.round(top)}px`;
+    bubble.style.left = `${Math.round(left)}px`;
+    bubble.style.transform = placeBelow ? "translate(-50%, 0)" : "translate(-50%, -100%)";
+    bubble.classList.add("is-visible");
+  }
+
+  hideSelectionBubble() {
+    if (this.selectionBubbleEl) {
+      this.selectionBubbleEl.classList.remove("is-visible");
+    }
+  }
+
   cleanupInjectedUi() {
+    document.querySelectorAll(".crisp-recall-selection-bubble").forEach((bubble) => bubble.remove());
     document.querySelectorAll(".crisp-recall-floating-pill").forEach((pill) => pill.remove());
 
     document.querySelectorAll(".crisp-recall-card-line").forEach((cardLine) => {
@@ -1054,6 +1284,17 @@ class CrispRecallSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(this.plugin.settings.enableFloatingPill).onChange(async (v) => {
           this.plugin.settings.enableFloatingPill = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("启用划词制卡悬浮气泡 (Selection Floating Toolbar)")
+      .setDesc("在编辑模式选中文本时，自动在选区上方浮现 Apple 风格磨砂制卡微胶囊。")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.enableSelectionBubble).onChange(async (v) => {
+          this.plugin.settings.enableSelectionBubble = v;
+          if (!v) this.plugin.hideSelectionBubble();
           await this.plugin.saveSettings();
         })
       );
