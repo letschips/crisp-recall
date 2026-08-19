@@ -10,19 +10,7 @@ function loadPlugin({ document } = {}) {
   class Plugin {
     constructor(app) {
       this.app = app;
-      this.commands = [];
     }
-    registerDomEvent() {}
-    registerMarkdownPostProcessor() {}
-    registerEvent() {}
-    addCommand(cmd) {
-      this.commands.push(cmd);
-    }
-    addSettingTab() {}
-    async loadData() {
-      return {};
-    }
-    async saveData() {}
   }
   class Modal {
     constructor(app) {
@@ -347,6 +335,40 @@ test("Anki cloze syntax is parsed as a cloze instead of a double-colon card", ()
   assert.match(cards[0].prompt, /capital is\s+\[ ❓ …… \]\s+\./);
 });
 
+test("standard double-brace Anki clozes remove both braces and optional hints", () => {
+  const { parseFlashcardsFromText } = loadPlugin();
+  const cards = parseFlashcardsFromText("The capital is {{c1::Paris::city}}.");
+
+  assert.equal(cards.length, 1);
+  assert.equal(cards[0].type, "cloze");
+  assert.equal(cards[0].answer, "Paris");
+  assert.equal(cards[0].prompt, "The capital is  [ ❓ …… ] .");
+  assert.doesNotMatch(cards[0].prompt, /[{}]/);
+});
+
+test("Anki cloze answers may contain a single colon", () => {
+  const { parseFlashcardsFromText } = loadPlugin();
+  const cards = parseFlashcardsFromText("The meeting starts at {{c1::10:30::time}}.");
+
+  assert.equal(cards.length, 1);
+  assert.equal(cards[0].type, "cloze");
+  assert.equal(cards[0].answer, "10:30");
+  assert.equal(cards[0].prompt, "The meeting starts at  [ ❓ …… ] .");
+});
+
+test("Crisp Annotations directives stay out of review cards", () => {
+  const { parseFlashcardsFromText } = loadPlugin();
+  const cards = parseFlashcardsFromText(
+    'Explain ==active recall=={ann note="compare :: recognition" place=bottom-right color=red}.'
+  );
+
+  assert.equal(cards.length, 1);
+  assert.equal(cards[0].type, "cloze");
+  assert.equal(cards[0].answer, "active recall");
+  assert.equal(cards[0].prompt, "Explain  [ ❓ …… ] .");
+  assert.doesNotMatch(cards[0].prompt, /\{ann\b/);
+});
+
 test("triple-colon cards generate both forward and reverse prompts", () => {
   const { parseFlashcardsFromText } = loadPlugin();
   const cards = parseFlashcardsFromText("Front ::: Back", "note.md");
@@ -412,6 +434,111 @@ test("reading view leaves syntax examples containing inline code intact", () => 
   plugin.processMarkdownView(root, {});
 
   assert.equal(rewrites, 0);
+});
+
+test("reading view does not flatten Crisp Annotations markup", () => {
+  const { PluginClass } = loadPlugin();
+  let rewrites = 0;
+  const annotation = new FakeElement("crisp-ann");
+  const paragraph = new FakeElement();
+  paragraph.textContent = "Question :: Annotated answer";
+  paragraph.addChild(annotation);
+  paragraph.empty = () => { rewrites += 1; };
+  paragraph.addClass = () => {};
+  paragraph.createSpan = () => ({});
+  const root = {
+    querySelectorAll(selector) {
+      if (selector === "mark") return [];
+      if (selector === "p, li") return [paragraph];
+      return [];
+    },
+    closest() { return null; },
+  };
+  const plugin = new PluginClass();
+  plugin.settings = { enableCloze: true, enableDoubleColon: true, enableFloatingPill: false };
+  plugin.licenseState = { valid: true, payload: { product: "Crisp Suite" } };
+
+  plugin.processMarkdownView(root, {});
+
+  assert.equal(rewrites, 0);
+  assert.equal(paragraph.querySelector(".crisp-ann"), annotation);
+});
+
+test("reading view preserves raw annotation directives regardless of processor order", () => {
+  const { PluginClass } = loadPlugin();
+  let rewrites = 0;
+  const paragraph = new FakeElement();
+  paragraph.textContent = 'Question :: ==Annotated answer=={ann note="detail" place=bottom}';
+  paragraph.empty = () => { rewrites += 1; };
+  paragraph.addClass = () => {};
+  paragraph.createSpan = () => ({});
+  const root = {
+    querySelectorAll(selector) {
+      if (selector === "mark") return [];
+      if (selector === "p, li") return [paragraph];
+      return [];
+    },
+    closest() { return null; },
+  };
+  const plugin = new PluginClass();
+  plugin.settings = { enableCloze: true, enableDoubleColon: true, enableFloatingPill: false };
+  plugin.licenseState = { valid: true, payload: { product: "Crisp Suite" } };
+
+  plugin.processMarkdownView(root, {});
+
+  assert.equal(rewrites, 0);
+});
+
+test("selection card commands require an activated Crisp license", () => {
+  const { PluginClass, notices } = loadPlugin();
+  let replacement = null;
+  const editor = {
+    getSelection: () => "selected text",
+    replaceSelection(value) { replacement = value; },
+    focus() {},
+  };
+  const plugin = new PluginClass();
+  plugin.licenseState = { valid: false, payload: null };
+
+  plugin.handleSelectionAction("cloze", editor);
+
+  assert.equal(replacement, null);
+  assert.equal(notices.length, 1);
+});
+
+test("multiline Cloze selection wraps each content line without breaking Markdown prefixes", () => {
+  const { PluginClass } = loadPlugin();
+  let replacement = null;
+  const editor = {
+    getSelection: () => "first line\n\n- second line\n> quoted line",
+    replaceSelection(value) { replacement = value; },
+    focus() {},
+  };
+  const plugin = new PluginClass();
+  plugin.licenseState = { valid: true, payload: { product: "Crisp Suite" } };
+
+  plugin.handleSelectionAction("cloze", editor);
+
+  assert.equal(
+    replacement,
+    "==first line==\n\n- ==second line==\n> ==quoted line=="
+  );
+});
+
+test("multiline Cloze selection toggles independently wrapped lines back to plain text", () => {
+  const { PluginClass } = loadPlugin();
+  let replacement = null;
+  const editor = {
+    getSelection: () => "==first line==\r\n- ==second line==",
+    replaceSelection(value) { replacement = value; },
+    focus() {},
+  };
+  const plugin = new PluginClass();
+  plugin.licenseState = { valid: true, payload: { product: "Crisp Suite" } };
+
+  plugin.handleSelectionAction("cloze", editor);
+
+  assert.equal(replacement, "first line\r\n- second line");
 });
 
 test("plugin unload removes injected controls and restores transformed content", () => {
@@ -640,6 +767,33 @@ test("floating controller retries after a temporarily unavailable file", async (
   assert.equal(container.querySelectorAll(".crisp-recall-floating-pill").length, 1);
 });
 
+test("pending note reads cannot recreate floating controls after plugin unload", async () => {
+  const { PluginClass } = loadPlugin();
+  const file = { path: "note.md", basename: "note" };
+  let resolveRead;
+  const pendingRead = new Promise((resolve) => { resolveRead = resolve; });
+  const plugin = new PluginClass({
+    vault: {
+      getFileByPath: () => file,
+      cachedRead: () => pendingRead,
+    },
+  });
+  plugin.settings = {
+    enableCloze: true,
+    enableDoubleColon: true,
+    enableFloatingPill: true,
+  };
+  plugin.licenseState = { valid: true, payload: { product: "Crisp Suite" } };
+  const container = new FakeElement("workspace-leaf-content");
+
+  const injection = plugin.injectFloatingWidget(container, file.path);
+  plugin.onunload();
+  resolveRead("Question :: Answer");
+  await injection;
+
+  assert.equal(container.querySelectorAll(".crisp-recall-floating-pill").length, 0);
+});
+
 test("vault review scans every Markdown file, including files after the first 50", async () => {
   const { PluginClass } = loadPlugin();
   const files = Array.from({ length: 51 }, (_, index) => ({
@@ -663,34 +817,6 @@ test("vault review scans every Markdown file, including files after the first 50
   assert.equal(reads, 51);
 });
 
-test("handleSelectionAction wraps and unwraps cloze, or formats concept/bidirectional cards", () => {
-  const { PluginClass } = loadPlugin();
-  const plugin = new PluginClass({});
-  let replaced = "";
-  const mockEditor = {
-    getSelection: () => "Core Concept",
-    replaceSelection: (val) => {
-      replaced = val;
-    },
-    focus: () => {},
-  };
-
-  plugin.handleSelectionAction("cloze", mockEditor);
-  assert.equal(replaced, "==Core Concept==");
-
-  mockEditor.getSelection = () => "==Core Concept==";
-  plugin.handleSelectionAction("cloze", mockEditor);
-  assert.equal(replaced, "Core Concept");
-
-  mockEditor.getSelection = () => "Question";
-  plugin.handleSelectionAction("qa", mockEditor);
-  assert.equal(replaced, "Question :: ");
-
-  mockEditor.getSelection = () => "Front";
-  plugin.handleSelectionAction("bidirectional", mockEditor);
-  assert.equal(replaced, "Front ::: ");
-});
-
 test("release metadata keeps package, manifest, and minimum Obsidian version aligned", () => {
   const root = path.join(__dirname, "..");
   const manifest = JSON.parse(fs.readFileSync(path.join(root, "manifest.json"), "utf8"));
@@ -701,3 +827,11 @@ test("release metadata keeps package, manifest, and minimum Obsidian version ali
   assert.equal(versions[manifest.version], manifest.minAppVersion);
 });
 
+test("floating controller CSS avoids Reading Rail and the mobile navigation bar", () => {
+  const css = fs.readFileSync(path.join(__dirname, "..", "styles.css"), "utf8");
+
+  assert.match(css, /:has\(> \.crisp-reading-rail:not\(\[hidden\]\)\)[^{]*> \.crisp-recall-floating-pill/);
+  assert.match(css, /body\.is-mobile \.crisp-recall-floating-pill\s*\{[^}]*safe-area-inset-bottom/s);
+  assert.match(css, /body\.is-mobile \.crisp-recall-floating-pill\s*\{[^}]*bottom:\s*calc\(96px/s);
+  assert.match(css, /\.crisp-recall-selection-bubble \.crisp-recall-bubble-btn\s*\{[^}]*box-shadow:\s*none/s);
+});

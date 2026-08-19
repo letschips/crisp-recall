@@ -1,5 +1,5 @@
 /* ==========================================================================
-   Crisp Recall — Zero-Friction Active Recall & Zen Flashcard Engine (v0.1.0)
+   Crisp Recall — Zero-Friction Active Recall & Zen Flashcard Engine (v0.2.4)
    Crafted by letschips (Xiaohongshu)
    ========================================================================== */
 
@@ -94,6 +94,11 @@
   font-size: 0.85rem;
   color: var(--text-normal);
   transition: box-shadow 0.2s ease, border-color 0.2s ease, transform 0.2s ease;
+}
+
+.workspace-leaf-content:has(> .crisp-reading-rail:not([hidden]))
+  > .crisp-recall-floating-pill {
+  right: 52px;
 }
 
 .crisp-recall-floating-pill:hover {
@@ -446,7 +451,7 @@
 @media (max-width: 600px) {
   .crisp-recall-floating-pill {
     right: 12px;
-    bottom: calc(72px + env(safe-area-inset-bottom, 0px));
+    bottom: calc(96px + env(safe-area-inset-bottom, 0px));
     max-width: calc(100% - 24px);
     gap: 5px;
     padding: 5px 8px;
@@ -514,9 +519,22 @@
   }
 }
 
+body.is-mobile .crisp-recall-floating-pill {
+  right: 12px;
+  bottom: calc(96px + env(safe-area-inset-bottom, 0px));
+  max-width: calc(100% - 24px);
+}
+
+body.is-mobile
+  .workspace-leaf-content:has(> .crisp-reading-rail:not([hidden]))
+  > .crisp-recall-floating-pill {
+  right: 48px;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .crisp-recall-cloze,
   .crisp-recall-floating-pill,
+  .crisp-recall-selection-bubble,
   .crisp-recall-card-3d,
   .crisp-recall-modal__progress-bar,
   .crisp-recall-summary__icon {
@@ -581,6 +599,7 @@
 .crisp-recall-selection-bubble {
   position: fixed;
   z-index: var(--layer-popover, 9999);
+  box-sizing: border-box;
   display: flex;
   align-items: center;
   gap: 2px;
@@ -589,8 +608,10 @@
   background: var(--background-secondary, #222225);
   border: 1px solid var(--background-modifier-border, rgba(255, 255, 255, 0.14));
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35), 0 0 1px rgba(255, 255, 255, 0.2) inset;
+  max-width: calc(100vw - 16px);
   transform: translate(-50%, -100%);
   opacity: 0;
+  visibility: hidden;
   pointer-events: none;
   user-select: none;
   transition: opacity 0.12s ease;
@@ -604,10 +625,11 @@
 
 .crisp-recall-selection-bubble.is-visible {
   opacity: 1;
+  visibility: visible;
   pointer-events: auto;
 }
 
-.crisp-recall-bubble-btn {
+.crisp-recall-selection-bubble .crisp-recall-bubble-btn {
   display: inline-flex;
   align-items: center;
   gap: 4px;
@@ -618,29 +640,36 @@
   color: var(--text-normal, rgba(255, 255, 255, 0.9));
   background: transparent;
   border: none;
+  box-shadow: none;
   border-radius: 999px;
   cursor: pointer;
   white-space: nowrap;
   line-height: 1.2;
   transition: background 0.1s ease, color 0.1s ease;
+  touch-action: manipulation;
 }
 
-.theme-light .crisp-recall-bubble-btn {
+.theme-light .crisp-recall-selection-bubble .crisp-recall-bubble-btn {
   color: rgba(0, 0, 0, 0.85);
 }
 
-.crisp-recall-bubble-btn:hover {
+.crisp-recall-selection-bubble .crisp-recall-bubble-btn:hover {
   background: var(--background-modifier-hover, rgba(255, 255, 255, 0.15));
   color: var(--text-normal, #ffffff);
 }
 
-.theme-light .crisp-recall-bubble-btn:hover {
+.theme-light .crisp-recall-selection-bubble .crisp-recall-bubble-btn:hover {
   background: var(--background-modifier-hover, rgba(0, 0, 0, 0.06));
   color: #000000;
 }
 
-.crisp-recall-bubble-btn:active {
+.crisp-recall-selection-bubble .crisp-recall-bubble-btn:active {
   background: var(--background-modifier-active-hover, rgba(255, 255, 255, 0.25));
+}
+
+.crisp-recall-selection-bubble .crisp-recall-bubble-btn:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 1px;
 }
 
 .crisp-recall-bubble-icon {
@@ -659,3 +688,11 @@
   background: var(--background-modifier-border, rgba(0, 0, 0, 0.1));
 }
 
+body.is-mobile .crisp-recall-selection-bubble {
+  padding: 4px 6px;
+}
+
+body.is-mobile .crisp-recall-selection-bubble .crisp-recall-bubble-btn {
+  min-height: 34px;
+  padding: 6px 8px;
+}

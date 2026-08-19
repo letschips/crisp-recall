@@ -1,5 +1,5 @@
 /* ==========================================================================
-   Crisp Recall — Zero-Friction Active Recall & Zen Flashcard Engine (v0.2.0)
+   Crisp Recall — Zero-Friction Active Recall & Zen Flashcard Engine (v0.2.4)
    Crafted by letschips (Xiaohongshu)
    ========================================================================== */
 
@@ -186,12 +186,57 @@ function maskInlineCode(text) {
   return masked.join("");
 }
 
+function maskCrispAnnotationDirectives(text) {
+  return text.replace(
+    /\{ann\s+(?:"(?:\\.|[^"\\])*"|[^}])*\}/gi,
+    (match) => " ".repeat(match.length),
+  );
+}
+
+function stripCrispAnnotationDirectives(text) {
+  return text.replace(/\{ann\s+(?:"(?:\\.|[^"\\])*"|[^}])*\}/gi, "").trim();
+}
+
 function stripCardPrefix(text) {
   return text.replace(/^[-*+]\s+/, "").replace(/^\d+\.\s+/, "").trim();
 }
 
+function formatClozeSelection(selection) {
+  const chunks = selection.split(/(\r?\n)/);
+  const lines = chunks
+    .filter((_chunk, index) => index % 2 === 0)
+    .map((line) => {
+      const match = line.match(/^(\s*(?:(?:>\s*)+)?(?:(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s+)?)?)(.*)$/);
+      const prefix = match?.[1] || "";
+      const rawBody = match?.[2] || "";
+      const suffix = rawBody.match(/\s*$/)?.[0] || "";
+      const body = suffix ? rawBody.slice(0, -suffix.length) : rawBody;
+      return {
+        prefix,
+        body,
+        suffix,
+        eligible: body.length > 0,
+        wrapped: body.startsWith("==") && body.endsWith("==") && body.length >= 4,
+      };
+    });
+  const eligibleLines = lines.filter((line) => line.eligible);
+  const unwrap = eligibleLines.length > 0 && eligibleLines.every((line) => line.wrapped);
+  let lineIndex = 0;
+
+  return chunks.map((chunk, index) => {
+    if (index % 2 === 1) return chunk;
+    const line = lines[lineIndex++];
+    if (!line.eligible) return chunk;
+    if (unwrap) {
+      return `${line.prefix}${line.body.slice(2, -2)}${line.suffix}`;
+    }
+    if (line.wrapped) return chunk;
+    return `${line.prefix}==${line.body}==${line.suffix}`;
+  }).join("");
+}
+
 function findDoubleColonSeparator(searchableLine) {
-  const withoutAnkiClozes = searchableLine.replace(/\{c\d+::[^}]+\}/gi, (match) => " ".repeat(match.length));
+  const withoutAnkiClozes = searchableLine.replace(/\{\{?c\d+::[^}]+\}\}?/gi, (match) => " ".repeat(match.length));
   const doubleIndex = withoutAnkiClozes.indexOf("::");
   if (doubleIndex === -1) return null;
 
@@ -205,11 +250,13 @@ function findDoubleColonSeparator(searchableLine) {
 }
 
 function parseDoubleColonLine(line) {
-  const separatorInfo = findDoubleColonSeparator(maskInlineCode(line));
+  const separatorInfo = findDoubleColonSeparator(maskCrispAnnotationDirectives(maskInlineCode(line)));
   if (!separatorInfo) return null;
 
-  const prompt = stripCardPrefix(line.slice(0, separatorInfo.index));
-  const answer = line.slice(separatorInfo.index + separatorInfo.separator.length).trim();
+  const prompt = stripCardPrefix(stripCrispAnnotationDirectives(line.slice(0, separatorInfo.index)));
+  const answer = stripCrispAnnotationDirectives(
+    line.slice(separatorInfo.index + separatorInfo.separator.length),
+  );
   if (!prompt || !answer || /^https?:\/\//i.test(prompt)) return null;
 
   return { prompt, answer, isBiDirectional: separatorInfo.isBiDirectional };
@@ -248,7 +295,7 @@ function parseFlashcardsFromText(text, filePath = "", options = {}) {
     // Structural Markdown is documentation, not card content.
     if (line.startsWith("|") || /^#{1,6}\s/.test(line)) continue;
 
-    const searchableLine = maskInlineCode(line);
+    const searchableLine = maskCrispAnnotationDirectives(maskInlineCode(line));
 
     // 1. Double colon cards: "Prompt :: Answer" or "Prompt ::: Answer"
     const doubleColonCard = enableDoubleColon ? parseDoubleColonLine(line) : null;
@@ -295,17 +342,19 @@ function parseFlashcardsFromText(text, filePath = "", options = {}) {
       continue;
     }
 
-    // 3. Cloze Deletions: ==target== or {c1::target}
+    // 3. Cloze Deletions: ==target==, {{c1::target::hint}}, or legacy {c1::target}
     if (!enableCloze) continue;
-    const clozeRegex = /==([^=]+)==|\{c\d+::([^}]+)\}/g;
+    const clozeRegex = /==([^=]+)==|\{\{c\d+::((?:(?!::)[^}])+)(?:::[^}]*)?\}\}|\{c\d+::((?:(?!::)[^}])+)(?:::[^}]*)?\}/g;
     let match;
     let clozeIdx = 0;
     while ((match = clozeRegex.exec(searchableLine)) !== null) {
-      const target = (match[1] || match[2] || "").trim();
+      const target = (match[1] || match[2] || match[3] || "").trim();
       if (!target) continue;
       clozeIdx++;
       // Prompt is the sentence with [ ... ] replacing the target
-      const maskedSentence = `${line.slice(0, match.index)} [ ❓ …… ] ${line.slice(match.index + match[0].length)}`;
+      const maskedSentence = stripCrispAnnotationDirectives(
+        `${line.slice(0, match.index)} [ ❓ …… ] ${line.slice(match.index + match[0].length)}`,
+      );
       cards.push({
         id: `${filePath}:${i}:cloze:${clozeIdx}`,
         type: "cloze",
@@ -334,6 +383,7 @@ class CrispRecallReviewModal extends Modal {
     this.isComplete = false;
     this.stats = { good: 0, hard: 0, again: 0 };
     this.keyHandler = null;
+    this.keyWindow = null;
   }
 
   onOpen() {
@@ -360,15 +410,17 @@ class CrispRecallReviewModal extends Modal {
         else if (e.key === "3") this.rateCard("good");
       }
     };
-    window.addEventListener("keydown", this.keyHandler);
+    this.keyWindow = modalEl.ownerDocument?.defaultView || window;
+    this.keyWindow.addEventListener("keydown", this.keyHandler);
 
     this.renderCard();
   }
 
   onClose() {
-    if (this.keyHandler) {
-      window.removeEventListener("keydown", this.keyHandler);
+    if (this.keyHandler && this.keyWindow) {
+      this.keyWindow.removeEventListener("keydown", this.keyHandler);
       this.keyHandler = null;
+      this.keyWindow = null;
     }
     this.contentEl.empty();
   }
@@ -546,6 +598,11 @@ class CrispRecallReviewModal extends Modal {
 // --------------------------------------------------------------------------
 class CrispRecallPlugin extends Plugin {
   async onload() {
+    this.unloaded = false;
+    this.selectionDocuments = new Set();
+    this.selectionBubbleEls = new Map();
+    this.selectionFrames = new Map();
+    this.pointerSelectingDocuments = new Set();
     this.cleanupInjectedUi();
     this.reviewModals = new Set();
     const storedSettings = await this.loadData();
@@ -622,53 +679,36 @@ class CrispRecallPlugin extends Plugin {
       })
     );
 
-    // 5. Register Selection Change & Editor Events for Selection Floating Bubble
-    if (typeof document !== "undefined" && typeof this.registerDomEvent === "function") {
-      this.isPointerSelecting = false;
-
-      this.registerDomEvent(document, "pointerdown", (e) => {
-        if (this.selectionBubbleEl && this.selectionBubbleEl.contains?.(e.target)) return;
-        this.isPointerSelecting = true;
-        this.hideSelectionBubble();
+    // 5. Register selection events in the main window and every Obsidian popout.
+    if (typeof this.registerDomEvent === "function") {
+      const mainDocument = this.app.workspace?.containerEl?.ownerDocument
+        || (typeof document !== "undefined" ? document : null);
+      this.registerSelectionDocument(mainDocument);
+      this.app.workspace?.iterateAllLeaves?.((leaf) => {
+        this.registerSelectionDocument(leaf.view?.containerEl?.ownerDocument);
       });
-
-      this.registerDomEvent(document, "pointerup", (e) => {
-        if (this.selectionBubbleEl && this.selectionBubbleEl.contains?.(e.target)) return;
-        this.isPointerSelecting = false;
-        if (this._selectionDebounce) cancelAnimationFrame(this._selectionDebounce);
-        this._selectionDebounce = requestAnimationFrame(() => {
-          this.updateSelectionBubble();
-        });
-      });
-
-      this.registerDomEvent(document, "selectionchange", () => {
-        if (this.isPointerSelecting) return;
-        if (this._selectionDebounce) cancelAnimationFrame(this._selectionDebounce);
-        this._selectionDebounce = requestAnimationFrame(() => {
-          this.updateSelectionBubble();
-        });
-      });
-
-      this.registerDomEvent(document, "scroll", (e) => {
-        if (this.selectionBubbleEl && this.selectionBubbleEl.contains?.(e.target)) return;
-        this.hideSelectionBubble();
-      }, true);
-
-      this.registerDomEvent(document, "keydown", (e) => {
-        if (e.key === "Escape") {
-          this.hideSelectionBubble();
-        }
-      });
+      this.registerEvent(
+        this.app.workspace.on("window-open", (_workspaceWindow, windowObj) => {
+          this.registerSelectionDocument(windowObj?.document);
+        })
+      );
+      this.registerEvent(
+        this.app.workspace.on("window-close", (_workspaceWindow, windowObj) => {
+          this.detachSelectionDocument(windowObj?.document);
+        })
+      );
     }
 
     this.app.workspace.onLayoutReady(() => {
-      this.updateActiveLeafFloatingWidget();
+      if (!this.unloaded) this.updateActiveLeafFloatingWidget();
     });
 
     console.log("⚡ Crisp Recall Plugin loaded successfully.");
   }
 
   onunload() {
+    this.unloaded = true;
+    this.cancelSelectionFrames();
     if (this.reviewModals) {
       [...this.reviewModals].forEach((modal) => modal.close());
       this.reviewModals.clear();
@@ -678,7 +718,8 @@ class CrispRecallPlugin extends Plugin {
   }
 
   openReviewModal(cards, title) {
-    if (!this.ensureLicenseActivated()) return;
+    if (this.unloaded || !this.ensureLicenseActivated()) return;
+    this.hideSelectionBubble();
     const modal = new CrispRecallReviewModal(this.app, cards, title);
     if (!this.reviewModals) this.reviewModals = new Set();
     this.reviewModals.add(modal);
@@ -694,65 +735,133 @@ class CrispRecallPlugin extends Plugin {
     modal.open();
   }
 
-  ensureSelectionBubble() {
-    if (this.selectionBubbleEl && this.selectionBubbleEl.isConnected) {
-      return this.selectionBubbleEl;
-    }
-    const doc = typeof document !== "undefined" ? document : null;
-    if (!doc || !doc.body) return null;
+  registerSelectionDocument(doc) {
+    if (!doc || !doc.body || this.selectionDocuments?.has(doc)) return;
+    this.selectionDocuments.add(doc);
+
+    this.registerDomEvent(doc, "pointerdown", (event) => {
+      const bubble = this.selectionBubbleEls?.get(doc);
+      if (bubble?.contains?.(event.target)) return;
+      this.pointerSelectingDocuments.add(doc);
+      this.hideSelectionBubble(doc);
+    });
+
+    this.registerDomEvent(doc, "pointerup", (event) => {
+      this.pointerSelectingDocuments.delete(doc);
+      const bubble = this.selectionBubbleEls?.get(doc);
+      if (bubble?.contains?.(event.target)) return;
+      this.scheduleSelectionBubbleUpdate(doc);
+    });
+
+    this.registerDomEvent(doc, "selectionchange", () => {
+      if (!this.pointerSelectingDocuments.has(doc)) {
+        this.scheduleSelectionBubbleUpdate(doc);
+      }
+    });
+
+    this.registerDomEvent(doc, "scroll", (event) => {
+      const bubble = this.selectionBubbleEls?.get(doc);
+      if (!bubble?.contains?.(event.target)) this.hideSelectionBubble(doc);
+    }, true);
+
+    this.registerDomEvent(doc, "keydown", (event) => {
+      if (event.key === "Escape") this.hideSelectionBubble(doc);
+    });
+  }
+
+  detachSelectionDocument(doc) {
+    if (!doc) return;
+    this.cancelSelectionFrame(doc);
+    this.selectionBubbleEls?.get(doc)?.remove();
+    this.selectionBubbleEls?.delete(doc);
+    this.pointerSelectingDocuments?.delete(doc);
+    this.selectionDocuments?.delete(doc);
+  }
+
+  scheduleSelectionBubbleUpdate(doc) {
+    if (this.unloaded || !doc) return;
+    this.cancelSelectionFrame(doc);
+    const win = doc.defaultView;
+    if (!win?.requestAnimationFrame) return;
+    const frameId = win.requestAnimationFrame(() => {
+      this.selectionFrames?.delete(doc);
+      if (!this.unloaded) this.updateSelectionBubble(doc);
+    });
+    this.selectionFrames.set(doc, { frameId, win });
+  }
+
+  cancelSelectionFrame(doc) {
+    const pending = this.selectionFrames?.get(doc);
+    if (!pending) return;
+    pending.win?.cancelAnimationFrame?.(pending.frameId);
+    this.selectionFrames.delete(doc);
+  }
+
+  cancelSelectionFrames() {
+    if (!this.selectionFrames) return;
+    for (const [doc] of this.selectionFrames) this.cancelSelectionFrame(doc);
+  }
+
+  ensureSelectionBubble(doc) {
+    const existing = this.selectionBubbleEls?.get(doc);
+    if (existing?.isConnected) return existing;
+    if (!doc?.body) return null;
 
     const bubble = doc.createElement("div");
     bubble.className = "crisp-recall-selection-bubble";
+    bubble.setAttribute("role", "toolbar");
+    bubble.setAttribute("aria-label", "Crisp Recall 划词制卡");
+    bubble.setAttribute("aria-hidden", "true");
 
-    const clozeBtn = bubble.createEl("button", {
-      cls: "crisp-recall-bubble-btn",
-      attr: { type: "button", title: "制作挖空 (Cloze ==文本==)" },
-    });
-    clozeBtn.innerHTML = '<span class="crisp-recall-bubble-icon">⚡</span><span>挖空</span>';
-    clozeBtn.addEventListener("pointerdown", (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      this.handleSelectionAction("cloze");
-    });
+    const addButton = (action, icon, label, title) => {
+      const button = doc.createElement("button");
+      button.className = "crisp-recall-bubble-btn";
+      button.type = "button";
+      button.title = title;
+      button.setAttribute("aria-label", title);
+      const iconEl = doc.createElement("span");
+      iconEl.className = "crisp-recall-bubble-icon";
+      iconEl.textContent = icon;
+      const labelEl = doc.createElement("span");
+      labelEl.textContent = label;
+      button.append(iconEl, labelEl);
+      button.addEventListener("pointerdown", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        this.handleSelectionAction(action);
+      });
+      bubble.append(button);
+    };
+    const addDivider = () => {
+      const divider = doc.createElement("div");
+      divider.className = "crisp-recall-bubble-divider";
+      divider.setAttribute("aria-hidden", "true");
+      bubble.append(divider);
+    };
 
-    bubble.createDiv({ cls: "crisp-recall-bubble-divider" });
-
-    const qaBtn = bubble.createEl("button", {
-      cls: "crisp-recall-bubble-btn",
-      attr: { type: "button", title: "制作问答卡 (问题 :: 答案)" },
-    });
-    qaBtn.innerHTML = '<span class="crisp-recall-bubble-icon">🗂️</span><span>问答</span>';
-    qaBtn.addEventListener("pointerdown", (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      this.handleSelectionAction("qa");
-    });
-
-    bubble.createDiv({ cls: "crisp-recall-bubble-divider" });
-
-    const biBtn = bubble.createEl("button", {
-      cls: "crisp-recall-bubble-btn",
-      attr: { type: "button", title: "制作双向卡 (正面 ::: 背面)" },
-    });
-    biBtn.innerHTML = '<span class="crisp-recall-bubble-icon">🔄</span><span>双向</span>';
-    biBtn.addEventListener("pointerdown", (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      this.handleSelectionAction("bidirectional");
-    });
+    addButton("cloze", "⚡", "挖空", "制作挖空 (Cloze ==文本==)");
+    addDivider();
+    addButton("qa", "🗂️", "问答", "制作问答卡 (问题 :: 答案)");
+    addDivider();
+    addButton("bidirectional", "🔄", "双向", "制作双向卡 (正面 ::: 背面)");
 
     doc.body.appendChild(bubble);
-    this.selectionBubbleEl = bubble;
+    this.selectionBubbleEls?.set(doc, bubble);
     return bubble;
   }
 
-  getActiveEditor() {
+  getActiveEditor(doc = null) {
     const activeLeaf = this.app.workspace?.activeLeaf;
     if (!activeLeaf || activeLeaf.view?.getViewType?.() !== "markdown") return null;
+    if (doc && activeLeaf.view.containerEl?.ownerDocument !== doc) return null;
     return activeLeaf.view.editor || null;
   }
 
   handleSelectionAction(action, directEditor = null) {
+    if (this.unloaded || !this.ensureLicenseActivated()) {
+      this.hideSelectionBubble();
+      return;
+    }
     const editor = directEditor || this.getActiveEditor();
     if (!editor) {
       this.hideSelectionBubble();
@@ -765,11 +874,7 @@ class CrispRecallPlugin extends Plugin {
     }
 
     if (action === "cloze") {
-      if (selection.startsWith("==") && selection.endsWith("==") && selection.length >= 4) {
-        editor.replaceSelection(selection.slice(2, -2));
-      } else {
-        editor.replaceSelection(`==${selection}==`);
-      }
+      editor.replaceSelection(formatClozeSelection(selection));
     } else if (action === "qa") {
       editor.replaceSelection(`${selection} :: `);
     } else if (action === "bidirectional") {
@@ -780,62 +885,77 @@ class CrispRecallPlugin extends Plugin {
     editor.focus?.();
   }
 
-  updateSelectionBubble() {
-    if (this.isPointerSelecting) return;
+  updateSelectionBubble(doc = null) {
+    if (this.unloaded) return;
+    const activeLeaf = this.app.workspace?.activeLeaf;
+    const view = activeLeaf?.view;
+    const activeDocument = view?.containerEl?.ownerDocument
+      || (typeof document !== "undefined" ? document : null);
+    doc = doc || activeDocument;
+    if (!doc || this.pointerSelectingDocuments?.has(doc)) return;
     if (!this.settings?.enableSelectionBubble) {
-      this.hideSelectionBubble();
+      this.hideSelectionBubble(doc);
       return;
     }
     if (!this.licenseState?.valid) {
-      this.hideSelectionBubble();
+      this.hideSelectionBubble(doc);
       return;
     }
 
-    const activeLeaf = this.app.workspace?.activeLeaf;
-    if (!activeLeaf || activeLeaf.view?.getViewType?.() !== "markdown") {
-      this.hideSelectionBubble();
+    if (!activeLeaf || view?.getViewType?.() !== "markdown" || activeDocument !== doc) {
+      this.hideSelectionBubble(doc);
       return;
     }
 
-    const view = activeLeaf.view;
     const mode = view.getMode?.() || view.currentMode?.type;
     if (mode === "preview") {
-      this.hideSelectionBubble();
+      this.hideSelectionBubble(doc);
       return;
     }
 
     const editor = view.editor;
     if (!editor) {
-      this.hideSelectionBubble();
+      this.hideSelectionBubble(doc);
       return;
     }
 
     const selectedText = editor.getSelection?.();
     if (!selectedText || selectedText.trim().length === 0) {
-      this.hideSelectionBubble();
+      this.hideSelectionBubble(doc);
       return;
     }
 
-    const win = view.containerEl?.ownerDocument?.defaultView || (typeof window !== "undefined" ? window : null);
+    const win = doc.defaultView;
     if (!win || typeof win.getSelection !== "function") {
-      this.hideSelectionBubble();
+      this.hideSelectionBubble(doc);
       return;
     }
 
     const domSelection = win.getSelection();
     if (!domSelection || domSelection.rangeCount === 0 || domSelection.isCollapsed) {
-      this.hideSelectionBubble();
+      this.hideSelectionBubble(doc);
       return;
     }
 
     const range = domSelection.getRangeAt(0);
+    const commonNode = range.commonAncestorContainer;
+    const commonElement = commonNode?.nodeType === 1 ? commonNode : commonNode?.parentElement;
+    if (
+      !commonElement
+      || !view.containerEl?.contains?.(commonElement)
+      || !commonElement.closest?.(".cm-editor")
+    ) {
+      this.hideSelectionBubble(doc);
+      return;
+    }
     const rect = range.getBoundingClientRect();
     if (rect.width === 0 && rect.height === 0) {
-      this.hideSelectionBubble();
+      this.hideSelectionBubble(doc);
       return;
     }
 
-    const bubble = this.ensureSelectionBubble();
+    this.hideSelectionBubble();
+    const bubble = this.ensureSelectionBubble(doc);
     if (!bubble) return;
 
     const bubbleWidth = bubble.offsetWidth || 190;
@@ -856,38 +976,56 @@ class CrispRecallPlugin extends Plugin {
     bubble.style.top = `${Math.round(top)}px`;
     bubble.style.left = `${Math.round(left)}px`;
     bubble.style.transform = placeBelow ? "translate(-50%, 0)" : "translate(-50%, -100%)";
+    bubble.setAttribute("aria-hidden", "false");
     bubble.classList.add("is-visible");
   }
 
-  hideSelectionBubble() {
-    if (this.selectionBubbleEl) {
-      this.selectionBubbleEl.classList.remove("is-visible");
+  hideSelectionBubble(doc = null) {
+    const bubbles = doc
+      ? [this.selectionBubbleEls?.get(doc)].filter(Boolean)
+      : Array.from(this.selectionBubbleEls?.values?.() || []);
+    for (const bubble of bubbles) {
+      bubble.classList.remove("is-visible");
+      bubble.setAttribute?.("aria-hidden", "true");
     }
   }
 
+  getPluginDocuments() {
+    const documents = new Set(this.selectionDocuments || []);
+    if (typeof document !== "undefined") documents.add(document);
+    this.app?.workspace?.iterateAllLeaves?.((leaf) => {
+      const doc = leaf.view?.containerEl?.ownerDocument;
+      if (doc) documents.add(doc);
+    });
+    return documents;
+  }
+
   cleanupInjectedUi() {
-    document.querySelectorAll(".crisp-recall-selection-bubble").forEach((bubble) => bubble.remove());
-    document.querySelectorAll(".crisp-recall-floating-pill").forEach((pill) => pill.remove());
+    for (const doc of this.getPluginDocuments()) {
+      doc.querySelectorAll(".crisp-recall-selection-bubble").forEach((bubble) => bubble.remove());
+      doc.querySelectorAll(".crisp-recall-floating-pill").forEach((pill) => pill.remove());
 
-    document.querySelectorAll(".crisp-recall-card-line").forEach((cardLine) => {
-      const originalHtml = cardLine.dataset.crispRecallOriginalHtml;
-      if (originalHtml !== undefined) {
-        cardLine.innerHTML = originalHtml;
-        delete cardLine.dataset.crispRecallOriginalHtml;
-      } else {
-        // Restore legacy v0.1.0 transformations that predate reversible snapshots.
-        const prompt = cardLine.querySelector(".crisp-recall-card-line__prompt")?.textContent || "";
-        const divider = cardLine.querySelector(".crisp-recall-card-line__divider")?.textContent || "::";
-        const answer = cardLine.querySelector(".crisp-recall-card-line__answer")?.textContent || "";
-        cardLine.textContent = `${prompt} ${divider} ${answer}`.trim();
-      }
-      cardLine.classList.remove("crisp-recall-card-line");
-    });
+      doc.querySelectorAll(".crisp-recall-card-line").forEach((cardLine) => {
+        const originalHtml = cardLine.dataset.crispRecallOriginalHtml;
+        if (originalHtml !== undefined) {
+          cardLine.innerHTML = originalHtml;
+          delete cardLine.dataset.crispRecallOriginalHtml;
+        } else {
+          // Restore legacy v0.1.0 transformations that predate reversible snapshots.
+          const prompt = cardLine.querySelector(".crisp-recall-card-line__prompt")?.textContent || "";
+          const divider = cardLine.querySelector(".crisp-recall-card-line__divider")?.textContent || "::";
+          const answer = cardLine.querySelector(".crisp-recall-card-line__answer")?.textContent || "";
+          cardLine.textContent = `${prompt} ${divider} ${answer}`.trim();
+        }
+        cardLine.classList.remove("crisp-recall-card-line");
+      });
 
-    document.querySelectorAll(".crisp-recall-cloze").forEach((cloze) => {
-      cloze.classList.remove("crisp-recall-cloze", "is-revealed");
-      if (cloze.title === "单击遮罩 / 翻转揭晓") cloze.removeAttribute("title");
-    });
+      doc.querySelectorAll(".crisp-recall-cloze").forEach((cloze) => {
+        cloze.classList.remove("crisp-recall-cloze", "is-revealed");
+        if (cloze.title === "单击遮罩 / 翻转揭晓") cloze.removeAttribute("title");
+      });
+    }
+    this.selectionBubbleEls?.clear();
   }
 
   async saveSettings() {
@@ -972,7 +1110,10 @@ class CrispRecallPlugin extends Plugin {
         const alreadyProcessed = el.classList?.contains?.("crisp-recall-card-line");
         const containsCode = el.querySelector("code, pre");
         const containsNestedList = el.querySelector("ul, ol");
-        if (!alreadyProcessed && !containsCode && !containsNestedList) {
+        const containsAnnotation = el.querySelector(".crisp-ann")
+          || el.querySelector(".crisp-ann__target")
+          || maskCrispAnnotationDirectives(text) !== text;
+        if (!alreadyProcessed && !containsCode && !containsNestedList && !containsAnnotation) {
           const card = parseDoubleColonLine(text);
           if (card) {
             const { prompt, answer } = card;
@@ -1013,8 +1154,10 @@ class CrispRecallPlugin extends Plugin {
   }
 
   async updateActiveLeafFloatingWidget(forceSourcePath = null) {
-    if (!this.settings.enableFloatingPill || !this.isLicenseValid()) {
-      document.querySelectorAll(".crisp-recall-floating-pill").forEach((p) => p.remove());
+    if (this.unloaded || !this.settings.enableFloatingPill || !this.isLicenseValid()) {
+      for (const doc of this.getPluginDocuments()) {
+        doc.querySelectorAll(".crisp-recall-floating-pill").forEach((pill) => pill.remove());
+      }
       return;
     }
 
@@ -1043,7 +1186,7 @@ class CrispRecallPlugin extends Plugin {
   }
 
   async injectFloatingWidget(container, sourcePath, { force = false } = {}) {
-    if (!this.isLicenseValid()) return;
+    if (this.unloaded || !this.isLicenseValid()) return;
 
     const existingPill = container.querySelector(".crisp-recall-floating-pill");
     if (!force && existingPill?.dataset.crispRecallSource === sourcePath) return;
@@ -1064,7 +1207,7 @@ class CrispRecallPlugin extends Plugin {
       }
 
       const content = await this.app.vault.cachedRead(file);
-      if (!this.isLicenseValid()) return;
+      if (this.unloaded || !this.isLicenseValid()) return;
       if (this.floatingWidgetRequests.get(container)?.requestToken !== requestToken) return;
 
       const cards = parseFlashcardsFromText(content, sourcePath, this.settings);
@@ -1072,6 +1215,7 @@ class CrispRecallPlugin extends Plugin {
         container.querySelector(".crisp-recall-floating-pill")?.remove();
         return;
       }
+      if (this.unloaded) return;
 
       container.querySelector(".crisp-recall-floating-pill")?.remove();
       const pill = container.createDiv("crisp-recall-floating-pill");
@@ -1118,13 +1262,14 @@ class CrispRecallPlugin extends Plugin {
   }
 
   async startActiveNoteReview() {
-    if (!this.ensureLicenseActivated()) return;
+    if (this.unloaded || !this.ensureLicenseActivated()) return;
     const activeFile = this.app.workspace.getActiveFile();
     if (!activeFile) {
       new Notice("请先打开一篇包含闪卡的 Markdown 笔记。");
       return;
     }
     const content = await this.app.vault.read(activeFile);
+    if (this.unloaded) return;
     const cards = parseFlashcardsFromText(content, activeFile.path, this.settings);
     if (cards.length === 0) {
       new Notice(`「${activeFile.basename}」中没有检测到 :: 问答或 ==挖空== 闪卡。`);
@@ -1134,7 +1279,7 @@ class CrispRecallPlugin extends Plugin {
   }
 
   async startVaultRandomReview() {
-    if (!this.ensureLicenseActivated()) return;
+    if (this.unloaded || !this.ensureLicenseActivated()) return;
     const files = this.app.vault.getMarkdownFiles();
     const allCards = [];
     new Notice("⚡ 正在从全库扫描自测闪卡...");
@@ -1142,6 +1287,7 @@ class CrispRecallPlugin extends Plugin {
     let failedReads = 0;
     const batchSize = 25;
     for (let offset = 0; offset < files.length; offset += batchSize) {
+      if (this.unloaded) return;
       const batch = files.slice(offset, offset + batchSize);
       const results = await Promise.all(batch.map(async (file) => {
         try {
@@ -1155,6 +1301,8 @@ class CrispRecallPlugin extends Plugin {
       }));
       results.forEach((cards) => allCards.push(...cards));
     }
+
+    if (this.unloaded) return;
 
     if (allCards.length === 0) {
       new Notice("全库中暂未找到任何自测闪卡，快去笔记中用「::」或「==挖空==」试试吧！");
@@ -1265,6 +1413,7 @@ class CrispRecallSettingTab extends PluginSettingTab {
         t.setValue(this.plugin.settings.enableCloze).onChange(async (v) => {
           this.plugin.settings.enableCloze = v;
           await this.plugin.saveSettings();
+          this.plugin.refreshReadingViews();
         })
       );
 
@@ -1275,6 +1424,7 @@ class CrispRecallSettingTab extends PluginSettingTab {
         t.setValue(this.plugin.settings.enableDoubleColon).onChange(async (v) => {
           this.plugin.settings.enableDoubleColon = v;
           await this.plugin.saveSettings();
+          this.plugin.refreshReadingViews();
         })
       );
 
@@ -1285,6 +1435,7 @@ class CrispRecallSettingTab extends PluginSettingTab {
         t.setValue(this.plugin.settings.enableFloatingPill).onChange(async (v) => {
           this.plugin.settings.enableFloatingPill = v;
           await this.plugin.saveSettings();
+          await this.plugin.updateActiveLeafFloatingWidget();
         })
       );
 
