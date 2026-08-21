@@ -4,6 +4,8 @@
    ========================================================================== */
 
 const { Plugin, Modal, Setting, PluginSettingTab, Notice, requestUrl } = require("obsidian");
+const fs = require("fs");
+const path = require("path");
 
 const DEFAULT_SETTINGS = {
   enableCloze: true,
@@ -59,6 +61,32 @@ function resolveRecallLicensePermission(payload) {
     allowed: true,
     onlinePluginId: originalPluginId || fallbackPluginId,
   };
+}
+
+function discoverVaultCrispLicense(app) {
+  try {
+    const configDir = app?.vault?.configDir || ".obsidian";
+    const basePath = app?.vault?.adapter?.basePath || "";
+    if (!basePath) return null;
+    const pluginsDir = path.join(basePath, configDir, "plugins");
+    if (!fs.existsSync(pluginsDir)) return null;
+
+    const dirs = fs.readdirSync(pluginsDir);
+    for (const dir of dirs) {
+      if (dir.startsWith("crisp-")) {
+        const dataPath = path.join(pluginsDir, dir, "data.json");
+        if (fs.existsSync(dataPath)) {
+          try {
+            const data = JSON.parse(fs.readFileSync(dataPath, "utf-8"));
+            if (data && data.licenseCode && typeof data.licenseCode === "string" && data.licenseCode.includes(".")) {
+              return data.licenseCode.trim();
+            }
+          } catch (e) {}
+        }
+      }
+    }
+  } catch (e) {}
+  return null;
 }
 
 function getCryptoSubtle() {
@@ -1043,11 +1071,21 @@ class CrispRecallPlugin extends Plugin {
   }
 
   async refreshLicenseState(options = {}) {
-    if (!this.settings.licenseCode) {
+    let targetCode = this.settings.licenseCode;
+    if (!targetCode) {
+      const discovered = discoverVaultCrispLicense(this.app);
+      if (discovered) {
+        targetCode = discovered;
+        this.settings.licenseCode = targetCode;
+        await this.saveSettings();
+      }
+    }
+
+    if (!targetCode) {
       this.licenseState = { valid: false, payload: null, reason: "尚未输入 Crisp 授权码" };
       return this.licenseState;
     }
-    const result = await verifyCrispRecallLicense(this.settings.licenseCode, options);
+    const result = await verifyCrispRecallLicense(targetCode, options);
     this.licenseState = result.valid
       ? { valid: true, payload: result.payload, reason: null }
       : { valid: false, payload: null, reason: result.reason || "授权码无效" };
