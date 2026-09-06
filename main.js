@@ -18,7 +18,7 @@ const DEFAULT_SETTINGS = {
   licenseCode: "",
 };
 
-const CRISP_LICENSE_VERIFY_URL = "https://crisp-license.helloherve-xsn.workers.dev/api/verify-device";
+const CRISP_LICENSE_VERIFY_URL = "https://license.letschips.xyz/api/verify-device";
 const CRISP_PUBLIC_KEY_PEM = `-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEAiz41HIDpD59SH3DjKnovUO+EEhTJXjvmiug/ev9t4ZQ=
 -----END PUBLIC KEY-----`;
@@ -155,17 +155,20 @@ async function verifyCrispRecallLicense(licenseCode, options = {}) {
     if (options.online === true || typeof options.request === "function") {
       const onlineRequest = options.request || requestUrl;
       try {
-        const response = await onlineRequest({
-          url: CRISP_LICENSE_VERIFY_URL,
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            licenseCode: trimmed,
-            deviceId: (options.getDeviceId || getDeviceId)(),
-            action: "activate",
-            pluginId: permission.onlinePluginId,
+        const response = await Promise.race([
+          onlineRequest({
+            url: CRISP_LICENSE_VERIFY_URL,
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              licenseCode: trimmed,
+              deviceId: (options.getDeviceId || getDeviceId)(),
+              action: "activate",
+              pluginId: permission.onlinePluginId,
+            }),
           }),
-        });
+          new Promise((_, reject) => setTimeout(() => reject(new Error("Crisp license check timeout")), 2500))
+        ]);
         const cloudResult = response.json;
         if (cloudResult && typeof cloudResult.valid === "boolean") {
           if (!cloudResult.valid) {
