@@ -166,15 +166,39 @@ async function verifyCrispRecallLicense(licenseCode, options = {}) {
               action: "activate",
               pluginId: permission.onlinePluginId,
             }),
+            throw: false,
           }),
           new Promise((_, reject) => setTimeout(() => reject(new Error("Crisp license check timeout")), 2500))
         ]);
-        const cloudResult = response.json;
-        if (cloudResult && typeof cloudResult.valid === "boolean") {
-          if (!cloudResult.valid) {
-            return { valid: false, reason: cloudResult.reason || "设备数已达上限" };
-          }
+
+        let cloudResult = null;
+        try {
+          cloudResult = response.json;
+        } catch {
+          cloudResult = null;
+        }
+
+        // 1. 明确的服务端业务拒绝（200/400/401/403 且带有明确的 valid: false）
+        const isAuthDenial =
+          (response.status === 200 || response.status === 400 || response.status === 401 || response.status === 403) &&
+          cloudResult !== null &&
+          cloudResult.valid === false;
+
+        if (isAuthDenial) {
+          return {
+            valid: false,
+            reason: cloudResult?.reason || "授权已被服务端拒绝或设备数已达上限"
+          };
+        }
+
+        // 2. 服务端明确批准（200 OK 且 valid: true）
+        if (response.status === 200 && cloudResult && cloudResult.valid === true) {
           return { valid: true, payload, message: cloudResult.message || null, source: "online" };
+        }
+
+        // 其余情况（404/408/429/5xx、网关故障等）均视为服务不可用，降级离线可用
+        if (response.status >= 400) {
+          console.warn(`[Crisp Recall] License server unavailable (status ${response.status}), offline fallback`);
         }
       } catch {
         console.debug("Crisp Recall license online check offline fallback");
