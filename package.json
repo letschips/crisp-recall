@@ -6,5 +6,6 @@
   "scripts": {
     "test": "node --test tests/*.test.js",
     "check": "node --check main.js && npm test"
-  }
+  },
+  "license": "SEE LICENSE IN LICENSE"
 }
