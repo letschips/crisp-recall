@@ -4,7 +4,7 @@
   "private": true,
   "description": "Active recall, cloze deletion, and flashcard review for Obsidian Markdown.",
   "scripts": {
-    "test": "node --test tests/*.test.js",
+    "test": "node --test tests/*.test.js && node --test tests/license-http.cjs",
     "check": "node --check main.js && npm test"
   },
   "license": "SEE LICENSE IN LICENSE"
