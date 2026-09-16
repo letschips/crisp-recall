@@ -3,6 +3,10 @@
    Crafted by letschips (Xiaohongshu)
    ========================================================================== */
 
+:root {
+  --crisp-recall-cloze-color: var(--interactive-accent);
+}
+
 /* --------------------------------------------------------------------------
  * 1. Inline Cloze & Q&A Mask Pills (Safe Glyph Rasterization — 0 GPU Clash)
  * -------------------------------------------------------------------------- */
@@ -16,25 +20,25 @@
   font-weight: 500;
   cursor: pointer;
   user-select: none;
-  border: 1px dashed var(--interactive-accent);
-  background: color-mix(in srgb, var(--interactive-accent) 12%, var(--background-secondary));
+  border: 1px dashed var(--crisp-recall-cloze-color, var(--interactive-accent));
+  background: color-mix(in srgb, var(--crisp-recall-cloze-color, var(--interactive-accent)) 12%, var(--background-secondary));
   color: transparent !important;
-  text-shadow: 0 0 6px color-mix(in srgb, var(--interactive-accent) 80%, var(--text-normal)) !important;
+  text-shadow: 0 0 6px color-mix(in srgb, var(--crisp-recall-cloze-color, var(--interactive-accent)) 80%, var(--text-normal)) !important;
   transition: color 0.22s ease, text-shadow 0.22s ease, background 0.22s ease, border-color 0.22s ease, box-shadow 0.22s ease;
 }
 
 .crisp-recall-cloze:hover {
-  background: color-mix(in srgb, var(--interactive-accent) 22%, var(--background-secondary));
-  border-color: var(--interactive-accent);
-  box-shadow: 0 2px 8px color-mix(in srgb, var(--interactive-accent) 20%, transparent);
-  text-shadow: 0 0 3px color-mix(in srgb, var(--interactive-accent) 95%, var(--text-normal)) !important;
+  background: color-mix(in srgb, var(--crisp-recall-cloze-color, var(--interactive-accent)) 22%, var(--background-secondary));
+  border-color: var(--crisp-recall-cloze-color, var(--interactive-accent));
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--crisp-recall-cloze-color, var(--interactive-accent)) 20%, transparent);
+  text-shadow: 0 0 3px color-mix(in srgb, var(--crisp-recall-cloze-color, var(--interactive-accent)) 95%, var(--text-normal)) !important;
 }
 
 .crisp-recall-cloze.is-revealed {
   color: var(--text-normal) !important;
   text-shadow: none !important;
-  background: color-mix(in srgb, var(--interactive-accent) 8%, transparent);
-  border: 1px solid color-mix(in srgb, var(--interactive-accent) 25%, transparent);
+  background: color-mix(in srgb, var(--crisp-recall-cloze-color, var(--interactive-accent)) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--crisp-recall-cloze-color, var(--interactive-accent)) 25%, transparent);
   user-select: auto;
   cursor: pointer;
 }
@@ -50,12 +54,12 @@
   padding: 4px 8px;
   border-radius: 8px;
   background: color-mix(in srgb, var(--background-secondary) 70%, transparent);
-  border-left: 3px solid var(--interactive-accent);
+  border-left: 3px solid var(--crisp-recall-cloze-color, var(--interactive-accent));
   transition: background 0.18s ease;
 }
 
 .crisp-recall-card-line:hover {
-  background: color-mix(in srgb, var(--interactive-accent) 6%, var(--background-secondary));
+  background: color-mix(in srgb, var(--crisp-recall-cloze-color, var(--interactive-accent)) 6%, var(--background-secondary));
 }
 
 .crisp-recall-card-line__prompt {
@@ -102,7 +106,7 @@
 }
 
 .crisp-recall-floating-pill:hover {
-  border-color: color-mix(in srgb, var(--interactive-accent) 35%, var(--background-modifier-border));
+  border-color: color-mix(in srgb, var(--crisp-recall-cloze-color, var(--interactive-accent)) 35%, var(--background-modifier-border));
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
 }
 
@@ -111,15 +115,15 @@
   align-items: center;
   gap: 4px;
   font-weight: 600;
-  color: var(--interactive-accent);
+  color: var(--crisp-recall-cloze-color, var(--interactive-accent));
 }
 
 .crisp-recall-pill-count {
   padding: 2px 6px;
   border-radius: 10px;
   font-size: 0.75rem;
-  background: color-mix(in srgb, var(--interactive-accent) 15%, transparent);
-  color: var(--interactive-accent);
+  background: color-mix(in srgb, var(--crisp-recall-cloze-color, var(--interactive-accent)) 15%, transparent);
+  color: var(--crisp-recall-cloze-color, var(--interactive-accent));
   font-weight: 700;
 }
 
@@ -138,18 +142,18 @@
 }
 
 .crisp-recall-pill-btn:hover {
-  background: var(--interactive-accent);
+  background: var(--crisp-recall-cloze-color, var(--interactive-accent));
   color: #ffffff;
 }
 
 .crisp-recall-pill-btn--cta {
-  background: var(--interactive-accent);
+  background: var(--crisp-recall-cloze-color, var(--interactive-accent));
   color: #ffffff;
   font-weight: 600;
 }
 
 .crisp-recall-pill-btn--cta:hover {
-  background: color-mix(in srgb, var(--interactive-accent) 85%, #000);
+  background: color-mix(in srgb, var(--crisp-recall-cloze-color, var(--interactive-accent)) 85%, #000);
 }
 
 /* --------------------------------------------------------------------------
@@ -235,7 +239,7 @@
 
 .crisp-recall-modal__progress-bar {
   height: 100%;
-  background: var(--interactive-accent);
+  background: var(--crisp-recall-cloze-color, var(--interactive-accent));
   transition: width 0.3s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
@@ -281,7 +285,7 @@
 }
 
 .crisp-recall-card-face--front {
-  border-top: 4px solid var(--interactive-accent);
+  border-top: 4px solid var(--crisp-recall-cloze-color, var(--interactive-accent));
 }
 
 .crisp-recall-card-face--back {

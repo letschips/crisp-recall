@@ -15,6 +15,7 @@ const DEFAULT_SETTINGS = {
   enableSelectionBubble: true,
   clozeDelimiter: "==",
   autoMaskInReadingView: true,
+  clozeColor: "",
   licenseCode: "",
 };
 
@@ -34,6 +35,16 @@ const CRISP_PRODUCT_PLUGIN_IDS = new Map([
   ["Crisp Recall", "crisp-recall"],
 ]);
 const CRISP_PLUGIN_IDS = new Set(CRISP_PRODUCT_PLUGIN_IDS.values());
+
+function normalizeHexColor(str, fallback = "#6b84bf") {
+  if (!str || typeof str !== "string") return fallback;
+  const s = str.trim();
+  if (/^#[0-9a-fA-F]{6}$/.test(s)) return s;
+  if (/^#[0-9a-fA-F]{3}$/.test(s)) {
+    return `#${s[1]}${s[1]}${s[2]}${s[2]}${s[3]}${s[3]}`;
+  }
+  return fallback;
+}
 
 function base64UrlToUint8Array(base64url) {
   const base64 = base64url.replace(/-/g, "+").replace(/_/g, "/");
@@ -665,9 +676,13 @@ class CrispRecallPlugin extends Plugin {
       licenseCode: typeof storedSettings?.licenseCode === "string"
         ? storedSettings.licenseCode.trim()
         : "",
+      clozeColor: typeof storedSettings?.clozeColor === "string"
+        ? storedSettings.clozeColor.trim()
+        : "",
     });
     this.licenseState = { valid: false, payload: null, reason: "尚未输入 Crisp 授权码" };
     await this.refreshLicenseState({ online: false });
+    this.applyCustomColor();
 
     // 1. Markdown Post Processor: Inline Cloze & Q&A Cards in Reading View
     this.registerMarkdownPostProcessor((element, context) => {
@@ -745,6 +760,9 @@ class CrispRecallPlugin extends Plugin {
       this.registerEvent(
         this.app.workspace.on("window-open", (_workspaceWindow, windowObj) => {
           this.registerSelectionDocument(windowObj?.document);
+          if (windowObj?.document) {
+            this.applyCustomColorToDocument(windowObj.document);
+          }
         })
       );
       this.registerEvent(
@@ -769,6 +787,7 @@ class CrispRecallPlugin extends Plugin {
       this.reviewModals.clear();
     }
     this.cleanupInjectedUi();
+    this.removeCustomColor();
     console.log("Crisp Recall Plugin unloaded.");
   }
 
@@ -1081,6 +1100,32 @@ class CrispRecallPlugin extends Plugin {
       });
     }
     this.selectionBubbleEls?.clear();
+  }
+
+  applyCustomColor() {
+    for (const doc of this.getPluginDocuments()) {
+      this.applyCustomColorToDocument(doc);
+    }
+  }
+
+  applyCustomColorToDocument(doc) {
+    if (!doc?.documentElement?.style) return;
+    const color = typeof this.settings.clozeColor === "string"
+      ? this.settings.clozeColor.trim()
+      : "";
+    if (color) {
+      doc.documentElement.style.setProperty("--crisp-recall-cloze-color", color);
+    } else {
+      doc.documentElement.style.removeProperty("--crisp-recall-cloze-color");
+    }
+  }
+
+  removeCustomColor() {
+    for (const doc of this.getPluginDocuments()) {
+      if (doc?.documentElement?.style) {
+        doc.documentElement.style.removeProperty("--crisp-recall-cloze-color");
+      }
+    }
   }
 
   async saveSettings() {
@@ -1481,6 +1526,86 @@ class CrispRecallSettingTab extends PluginSettingTab {
           this.plugin.refreshReadingViews();
         })
       );
+
+    const COLOR_PRESETS = [
+      { id: "default", name: "跟随主题强调色 (默认)", value: "" },
+      { id: "amber", name: "琥珀金黄 (Amber)", value: "#f59e0b" },
+      { id: "orange", name: "活力鲜橙 (Orange)", value: "#f97316" },
+      { id: "green", name: "清新薄荷绿 (Green)", value: "#10b981" },
+      { id: "blue", name: "湖水蔚蓝 (Blue)", value: "#3b82f6" },
+      { id: "purple", name: "优雅紫罗兰 (Purple)", value: "#8b5cf6" },
+      { id: "red", name: "珊瑚朱红 (Red)", value: "#ef4444" },
+      { id: "custom", name: "自定义拾色器 (Custom)", value: "custom" },
+    ];
+
+    const currentClozeColor = (this.plugin.settings.clozeColor || "").toLowerCase();
+    let currentPreset = COLOR_PRESETS.find((p) => p.value && p.value.toLowerCase() === currentClozeColor);
+    if (!currentPreset && currentClozeColor) {
+      currentPreset = COLOR_PRESETS.find((p) => p.id === "custom");
+    }
+    const selectedPresetId = currentPreset ? currentPreset.id : "default";
+
+    const getThemeAccentHex = () => {
+      try {
+        const doc = this.app?.workspace?.containerEl?.ownerDocument
+          || (typeof document !== "undefined" ? document : null);
+        if (!doc) return "#6b84bf";
+        const raw = getComputedStyle(doc.body).getPropertyValue("--interactive-accent").trim();
+        return normalizeHexColor(raw, "#6b84bf");
+      } catch (e) {
+        return "#6b84bf";
+      }
+    };
+
+    const colorSetting = new Setting(containerEl)
+      .setName("挖空自测高亮颜色 (Cloze Mask Color)")
+      .setDesc(
+        currentClozeColor
+          ? `当前已指定独立颜色：${currentClozeColor}。可在下拉选择预设、或用拾色器微调。`
+          : "当前跟随 Obsidian 全局主题强调色。指定独立颜色后将仅应用于自测挖空与翻转卡片。"
+      );
+
+    colorSetting.addDropdown((dropdown) => {
+      COLOR_PRESETS.forEach((p) => dropdown.addOption(p.id, p.name));
+      dropdown.setValue(selectedPresetId).onChange(async (newId) => {
+        if (newId === "default") {
+          this.plugin.settings.clozeColor = "";
+        } else if (newId === "custom") {
+          if (!this.plugin.settings.clozeColor) {
+            this.plugin.settings.clozeColor = getThemeAccentHex();
+          }
+        } else {
+          const found = COLOR_PRESETS.find((p) => p.id === newId);
+          if (found) this.plugin.settings.clozeColor = found.value;
+        }
+        await this.plugin.saveSettings();
+        this.plugin.applyCustomColor();
+        this.display();
+      });
+    });
+
+    colorSetting.addColorPicker((picker) => {
+      picker
+        .setValue(normalizeHexColor(currentClozeColor || getThemeAccentHex()))
+        .onChange(async (val) => {
+          this.plugin.settings.clozeColor = val;
+          await this.plugin.saveSettings();
+          this.plugin.applyCustomColor();
+          this.display();
+        });
+    });
+
+    colorSetting.addExtraButton((btn) => {
+      btn
+        .setIcon("reset")
+        .setTooltip("重置为跟随主题强调色")
+        .onClick(async () => {
+          this.plugin.settings.clozeColor = "";
+          await this.plugin.saveSettings();
+          this.plugin.applyCustomColor();
+          this.display();
+        });
+    });
 
     new Setting(containerEl)
       .setName("启用双冒号概念卡 (Concept :: Definition)")

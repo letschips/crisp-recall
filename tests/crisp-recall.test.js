@@ -835,3 +835,43 @@ test("floating controller CSS avoids Reading Rail and the mobile navigation bar"
   assert.match(css, /body\.is-mobile \.crisp-recall-floating-pill\s*\{[^}]*bottom:\s*calc\(96px/s);
   assert.match(css, /\.crisp-recall-selection-bubble \.crisp-recall-bubble-btn\s*\{[^}]*box-shadow:\s*none/s);
 });
+
+test("custom cloze color applies to documentElement and cleans up on unload", async () => {
+  const css = fs.readFileSync(path.join(__dirname, "..", "styles.css"), "utf8");
+  assert.match(css, /--crisp-recall-cloze-color:\s*var\(--interactive-accent\)/);
+
+  const styleMap = new Map();
+  const fakeDoc = {
+    querySelectorAll: () => [],
+    documentElement: {
+      style: {
+        setProperty: (prop, val) => styleMap.set(prop, val),
+        removeProperty: (prop) => styleMap.delete(prop),
+      },
+    },
+  };
+
+  const { PluginClass } = loadPlugin({ document: fakeDoc });
+  const plugin = new PluginClass({
+    workspace: {
+      iterateAllLeaves: () => {},
+      on: () => {},
+      onLayoutReady: (cb) => cb(),
+    },
+  });
+
+  plugin.settings = { clozeColor: "#f59e0b" };
+  plugin.applyCustomColor();
+  assert.equal(styleMap.get("--crisp-recall-cloze-color"), "#f59e0b");
+
+  plugin.settings.clozeColor = "";
+  plugin.applyCustomColor();
+  assert.equal(styleMap.has("--crisp-recall-cloze-color"), false);
+
+  plugin.settings.clozeColor = "#10b981";
+  plugin.applyCustomColor();
+  assert.equal(styleMap.get("--crisp-recall-cloze-color"), "#10b981");
+
+  plugin.onunload();
+  assert.equal(styleMap.has("--crisp-recall-cloze-color"), false);
+});
