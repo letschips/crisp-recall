@@ -4,6 +4,29 @@
    ========================================================================== */
 
 const { Plugin, Modal, Setting, PluginSettingTab, Notice, requestUrl } = require("obsidian");
+
+// Obsidian's Plugin.loadData() returns null for a missing data.json but undefined when the file exists
+// and cannot be read or parsed (sync conflict, interrupted write), and Plugin.saveData() swallows write
+// errors. These helpers keep such a file from being overwritten by defaults and make lost writes visible.
+
+function dataSafetyStamp(date) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+}
+
+/** Copies an unreadable data.json aside. On "failed" the caller must not write data.json this session. */
+async function preserveUnreadableData(adapter, dataPath, now = new Date()) {
+  try {
+    if (!adapter) throw new Error("vault adapter unavailable");
+    if (!(await adapter.exists(dataPath))) return { state: "missing" };
+    const backupPath = `${dataPath}.unreadable-${dataSafetyStamp(now)}`;
+    await adapter.write(backupPath, await adapter.read(dataPath));
+    return { state: "preserved", backupPath };
+  } catch (error) {
+    return { state: "failed", error };
+  }
+}
+
 const fs = require("fs");
 const path = require("path");
 
@@ -663,6 +686,25 @@ class CrispRecallReviewModal extends Modal {
 // 3. Crisp Recall Plugin Main Class
 // --------------------------------------------------------------------------
 class CrispRecallPlugin extends Plugin {
+
+  // Never overwrite a data.json that could not be read and could not be backed up either.
+  async saveData(data) {
+    if (this.dataWriteBlocked) return;
+    await super.saveData(data);
+  }
+
+  // loadData() yields undefined when data.json exists but cannot be read; keep a copy before defaults take over.
+  async protectUnreadableData(raw) {
+    if (raw !== undefined) return;
+    const result = await preserveUnreadableData(this.app?.vault?.adapter, `${this.manifest?.dir}/data.json`);
+    if (result.state === "preserved") {
+      new Notice(`Crisp Recall 的设置文件无法读取，已备份为 ${result.backupPath.split("/").pop()} 并恢复默认设置。`, 12000);
+    } else if (result.state === "failed") {
+      this.dataWriteBlocked = true;
+      console.error("Crisp Recall could not back up unreadable data.json", result.error);
+      new Notice("Crisp Recall 的设置文件无法读取，也无法备份。为保护原文件，本次运行不会保存设置。", 0);
+    }
+  }
   async onload() {
     this.unloaded = false;
     this.selectionDocuments = new Set();
@@ -672,6 +714,7 @@ class CrispRecallPlugin extends Plugin {
     this.cleanupInjectedUi();
     this.reviewModals = new Set();
     const storedSettings = await this.loadData();
+    await this.protectUnreadableData(storedSettings);
     this.settings = Object.assign({}, DEFAULT_SETTINGS, storedSettings, {
       licenseCode: typeof storedSettings?.licenseCode === "string"
         ? storedSettings.licenseCode.trim()
