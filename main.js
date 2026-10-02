@@ -97,29 +97,41 @@ function resolveRecallLicensePermission(payload) {
   };
 }
 
-function discoverVaultCrispLicense(app) {
+// 库内其它 Crisp 插件保存的授权码，按磁盘上的目录顺序去重收集（不含 Recall 自己）。
+function collectVaultCrispLicenseCandidates(app) {
+  const candidates = [];
+  const seen = new Set();
   try {
     const configDir = app?.vault?.configDir || ".obsidian";
     const basePath = app?.vault?.adapter?.basePath || "";
-    if (!basePath) return null;
+    if (!basePath) return candidates;
     const pluginsDir = path.join(basePath, configDir, "plugins");
-    if (!fs.existsSync(pluginsDir)) return null;
+    if (!fs.existsSync(pluginsDir)) return candidates;
 
-    const dirs = fs.readdirSync(pluginsDir);
-    for (const dir of dirs) {
-      if (dir.startsWith("crisp-")) {
-        const dataPath = path.join(pluginsDir, dir, "data.json");
-        if (fs.existsSync(dataPath)) {
-          try {
-            const data = JSON.parse(fs.readFileSync(dataPath, "utf-8"));
-            if (data && data.licenseCode && typeof data.licenseCode === "string" && data.licenseCode.includes(".")) {
-              return data.licenseCode.trim();
-            }
-          } catch (e) {}
+    for (const dir of fs.readdirSync(pluginsDir)) {
+      if (!dir.startsWith("crisp-") || dir === "crisp-recall") continue;
+      const dataPath = path.join(pluginsDir, dir, "data.json");
+      if (!fs.existsSync(dataPath)) continue;
+      try {
+        const data = JSON.parse(fs.readFileSync(dataPath, "utf-8"));
+        const code = typeof data?.licenseCode === "string" ? data.licenseCode.trim() : "";
+        if (code.includes(".") && !seen.has(code)) {
+          seen.add(code);
+          candidates.push(code);
         }
-      }
+      } catch (e) {}
     }
   } catch (e) {}
+  return candidates;
+}
+
+// 返回一张本地校验通过的授权码，找不到则返回 null。校验必须发生在写入设置之前：
+// 先保存后校验会把一张无效码固化下来，之后设置里已有码，就再也不会重新扫描。
+async function discoverVaultCrispLicense(app) {
+  for (const code of collectVaultCrispLicenseCandidates(app)) {
+    const local = await verifyCrispRecallLicense(code, { online: false });
+    if (local.valid) return code;
+  }
   return null;
 }
 
@@ -1188,7 +1200,7 @@ class CrispRecallPlugin extends Plugin {
   async refreshLicenseState(options = {}) {
     let targetCode = this.settings.licenseCode;
     if (!targetCode) {
-      const discovered = discoverVaultCrispLicense(this.app);
+      const discovered = await discoverVaultCrispLicense(this.app);
       if (discovered) {
         targetCode = discovered;
         this.settings.licenseCode = targetCode;
