@@ -61,7 +61,12 @@ function loadPlugin({ document } = {}) {
     " CrispRecallReviewModal," +
     " resolveRecallLicensePermission: typeof resolveRecallLicensePermission === 'function' ? resolveRecallLicensePermission : undefined," +
     " verifyCrispRecallLicense: typeof verifyCrispRecallLicense === 'function' ? verifyCrispRecallLicense : undefined," +
-    " renderRecallAboutCard: typeof renderRecallAboutCard === 'function' ? renderRecallAboutCard : undefined" +
+    " renderRecallAboutCard: typeof renderRecallAboutCard === 'function' ? renderRecallAboutCard : undefined," +
+    " scheduleRecallReview: typeof scheduleRecallReview === 'function' ? scheduleRecallReview : undefined," +
+    " previewRecallIntervals: typeof previewRecallIntervals === 'function' ? previewRecallIntervals : undefined," +
+    " recallAddDays: typeof recallAddDays === 'function' ? recallAddDays : undefined," +
+    " RecallReviewStore: typeof RecallReviewStore === 'function' ? RecallReviewStore : undefined," +
+    " buildDueReviewQueue: typeof buildDueReviewQueue === 'function' ? buildDueReviewQueue : undefined" +
     " };";
   vm.runInNewContext(source, sandbox, { filename: mainPath });
 
@@ -72,6 +77,11 @@ function loadPlugin({ document } = {}) {
     resolveRecallLicensePermission: sandbox.__crispRecallTest.resolveRecallLicensePermission,
     verifyCrispRecallLicense: sandbox.__crispRecallTest.verifyCrispRecallLicense,
     renderRecallAboutCard: sandbox.__crispRecallTest.renderRecallAboutCard,
+    scheduleRecallReview: sandbox.__crispRecallTest.scheduleRecallReview,
+    previewRecallIntervals: sandbox.__crispRecallTest.previewRecallIntervals,
+    recallAddDays: sandbox.__crispRecallTest.recallAddDays,
+    RecallReviewStore: sandbox.__crispRecallTest.RecallReviewStore,
+    buildDueReviewQueue: sandbox.__crispRecallTest.buildDueReviewQueue,
     notices,
   };
 }
@@ -1047,4 +1057,419 @@ test("custom cloze color applies to documentElement and cleans up on unload", as
 
   plugin.onunload();
   assert.equal(styleMap.has("--crisp-recall-cloze-color"), false);
+});
+
+// --------------------------------------------------------------------------
+// Spaced repetition
+// --------------------------------------------------------------------------
+
+const REVIEW_STATE_PATH = ".obsidian/plugins/crisp-recall/review-state.json";
+
+function makeMemoryAdapter(initial = {}) {
+  const files = new Map(Object.entries(initial));
+  const adapter = {
+    files,
+    writes: [],
+    failWrites: false,
+    dropWrites: false,
+    failReadPaths: new Set(),
+    async exists(filePath) {
+      return files.has(filePath);
+    },
+    async read(filePath) {
+      if (adapter.failReadPaths.has(filePath)) throw new Error("read failed");
+      if (!files.has(filePath)) throw new Error(`ENOENT ${filePath}`);
+      return files.get(filePath);
+    },
+    async write(filePath, data) {
+      adapter.writes.push(filePath);
+      if (adapter.failWrites) throw new Error("disk full");
+      if (adapter.dropWrites) return;
+      files.set(filePath, data);
+    },
+  };
+  return adapter;
+}
+
+function reviewStateText(files, version = 1) {
+  return JSON.stringify({ version, algorithm: "fsrs-5", files });
+}
+
+function reviewRecord(overrides = {}) {
+  return {
+    s: 3.173, d: 5.28243442, due: "2026-10-15", last: "2026-10-12", at: 100, reps: 1, lapses: 0, first: "2026-10-12",
+    ...overrides,
+  };
+}
+
+async function loadedStore(RecallReviewStore, initialFiles) {
+  const adapter = makeMemoryAdapter(
+    initialFiles === undefined ? {} : { [REVIEW_STATE_PATH]: reviewStateText(initialFiles) },
+  );
+  const store = new RecallReviewStore(adapter, REVIEW_STATE_PATH);
+  const result = await store.load();
+  return { adapter, store, result };
+}
+
+function savedFiles(adapter) {
+  return JSON.parse(adapter.files.get(REVIEW_STATE_PATH)).files;
+}
+
+test("card keys survive lines being inserted above and are independent of line numbers", () => {
+  const { parseFlashcardsFromText } = loadPlugin();
+  const before = parseFlashcardsFromText("Q :: A\nF ::: B\nRemember ==x== here", "n.md");
+  const after = parseFlashcardsFromText("intro\n\n- [ ] Q :: A\n\nF ::: B\n\nRemember ==x== here", "n.md");
+
+  assert.equal(before.length, 4);
+  assert.ok(before.every((card) => typeof card.key === "string" && card.key.length >= 6));
+  assert.deepEqual(after.map((card) => card.key), before.map((card) => card.key));
+  assert.equal(
+    parseFlashcardsFromText("Q  with   space :: A")[0].key,
+    parseFlashcardsFromText("Q with space :: A")[0].key,
+  );
+});
+
+test("card keys change with content and stay unique inside one note", () => {
+  const { parseFlashcardsFromText } = loadPlugin();
+  const cards = parseFlashcardsFromText("Q :: A\nQ :: A\nF ::: B\nThe ==a== and ==b==.\nB :: F", "n.md");
+  const keys = cards.map((card) => card.key);
+
+  assert.equal(new Set(keys).size, keys.length);
+  assert.equal(cards[1].key, `${cards[0].key}#2`);
+  // The reverse side of "F ::: B" asks the same question as "B :: F" but is a different card.
+  assert.notEqual(cards[3].key, cards[6].key);
+  assert.notEqual(parseFlashcardsFromText("Q :: A changed")[0].key, cards[0].key);
+});
+
+test("FSRS scheduling matches the ts-fsrs FSRS-5 reference for day-based reviews", () => {
+  const { scheduleRecallReview, previewRecallIntervals, recallAddDays } = loadPlugin();
+  const fixture = JSON.parse(fs.readFileSync(path.join(__dirname, "fixtures", "fsrs5-reference.json"), "utf8"));
+  const start = "2026-01-01";
+
+  for (const [name, steps] of Object.entries(fixture.sequences)) {
+    let record = null;
+    for (const [index, step] of steps.entries()) {
+      const label = `${name}[${index}]`;
+      const today = recallAddDays(start, step.day);
+      const preview = previewRecallIntervals(record, today);
+      assert.deepEqual([preview.again, preview.hard, preview.good], step.preview, `${label} preview`);
+
+      record = scheduleRecallReview(record, step.rating, today, 1000 + index);
+      assert.ok(Math.abs(record.s - step.s) < 1e-6, `${label} stability ${record.s} vs ${step.s}`);
+      assert.ok(Math.abs(record.d - step.d) < 1e-6, `${label} difficulty ${record.d} vs ${step.d}`);
+      assert.equal(record.due, recallAddDays(today, step.ivl), `${label} due`);
+      assert.equal(record.reps, step.reps, `${label} reps`);
+      assert.equal(record.lapses, step.lapses, `${label} lapses`);
+      assert.equal(record.last, today);
+      assert.equal(record.first, start);
+      assert.equal(record.at, 1000 + index);
+    }
+  }
+});
+
+test("calendar day arithmetic crosses month, year, and DST boundaries", () => {
+  const { recallAddDays } = loadPlugin();
+
+  assert.equal(recallAddDays("2026-03-28", 3), "2026-03-31");
+  assert.equal(recallAddDays("2026-10-24", 2), "2026-10-26");
+  assert.equal(recallAddDays("2026-12-31", 1), "2027-01-01");
+  assert.equal(recallAddDays("2028-02-28", 1), "2028-02-29");
+});
+
+test("a missing review file starts empty and the first rating is written and verified", async () => {
+  const { RecallReviewStore } = loadPlugin();
+  const { adapter, store, result } = await loadedStore(RecallReviewStore);
+
+  assert.equal(result.state, "missing");
+  assert.equal(store.get("a.md", "k1"), null);
+
+  store.rate("a.md", "k1", "good", "2026-10-15", 500);
+  const saved = await store.save();
+
+  assert.equal(saved.ok, true);
+  const state = JSON.parse(adapter.files.get(REVIEW_STATE_PATH));
+  assert.equal(state.version, 1);
+  assert.equal(state.files["a.md"].k1.due, "2026-10-18");
+  assert.equal(adapter.files.has(`${REVIEW_STATE_PATH}.bak`), false);
+});
+
+test("an unparseable review file is backed up before an empty state is used", async () => {
+  const { RecallReviewStore } = loadPlugin();
+  const adapter = makeMemoryAdapter({ [REVIEW_STATE_PATH]: "{\"version\":1,\"files\":{" });
+  const store = new RecallReviewStore(adapter, REVIEW_STATE_PATH);
+
+  const result = await store.load();
+
+  assert.equal(result.state, "preserved");
+  assert.equal(adapter.files.get(result.backupPath), "{\"version\":1,\"files\":{");
+  assert.match(result.backupPath, /review-state\.json\.unreadable-\d{8}-\d{6}$/);
+  store.rate("a.md", "k1", "good", "2026-10-15", 500);
+  assert.equal((await store.save()).ok, true);
+  assert.equal(adapter.files.get(result.backupPath), "{\"version\":1,\"files\":{");
+});
+
+test("an unreadable review file that cannot be backed up is never overwritten", async () => {
+  const { RecallReviewStore } = loadPlugin();
+  const adapter = makeMemoryAdapter({ [REVIEW_STATE_PATH]: "original" });
+  adapter.failReadPaths.add(REVIEW_STATE_PATH);
+  const store = new RecallReviewStore(adapter, REVIEW_STATE_PATH);
+
+  const result = await store.load();
+  store.rate("a.md", "k1", "good", "2026-10-15", 500);
+  const saved = await store.save();
+
+  assert.equal(result.state, "failed");
+  assert.equal(store.writeBlocked, true);
+  assert.equal(saved.ok, false);
+  assert.equal(adapter.files.get(REVIEW_STATE_PATH), "original");
+  assert.deepEqual(adapter.writes, []);
+});
+
+test("a review file written by a newer plugin version is read but not overwritten", async () => {
+  const { RecallReviewStore } = loadPlugin();
+  const text = reviewStateText({ "a.md": { k1: reviewRecord() } }, 2);
+  const adapter = makeMemoryAdapter({ [REVIEW_STATE_PATH]: text });
+  const store = new RecallReviewStore(adapter, REVIEW_STATE_PATH);
+
+  const result = await store.load();
+  store.rate("a.md", "k2", "good", "2026-10-15", 500);
+  const saved = await store.save();
+
+  assert.equal(result.state, "newer");
+  assert.equal(store.get("a.md", "k1").due, "2026-10-15");
+  assert.equal(saved.ok, false);
+  assert.equal(adapter.files.get(REVIEW_STATE_PATH), text);
+});
+
+test("a write that does not read back is reported and retried by the next save", async () => {
+  const { RecallReviewStore } = loadPlugin();
+  const { adapter, store } = await loadedStore(RecallReviewStore, { "a.md": { k1: reviewRecord() } });
+
+  adapter.dropWrites = true;
+  store.rate("a.md", "k2", "good", "2026-10-15", 500);
+  const dropped = await store.save();
+  assert.equal(dropped.ok, false);
+  assert.equal(store.get("a.md", "k2").reps, 1);
+
+  adapter.dropWrites = false;
+  adapter.failWrites = true;
+  const thrown = await store.save();
+  assert.equal(thrown.ok, false);
+
+  adapter.failWrites = false;
+  const retried = await store.save();
+  assert.equal(retried.ok, true);
+  assert.equal(savedFiles(adapter)["a.md"].k2.reps, 1);
+});
+
+test("the first write of a session keeps the previous review file as .bak", async () => {
+  const { RecallReviewStore } = loadPlugin();
+  const { adapter, store } = await loadedStore(RecallReviewStore, { "a.md": { k1: reviewRecord() } });
+  const original = adapter.files.get(REVIEW_STATE_PATH);
+
+  store.rate("a.md", "k2", "good", "2026-10-15", 500);
+  await store.save();
+  store.rate("a.md", "k3", "good", "2026-10-15", 600);
+  await store.save();
+
+  assert.equal(adapter.files.get(`${REVIEW_STATE_PATH}.bak`), original);
+});
+
+test("saving merges reviews another device synced in, keeping the newer record per card", async () => {
+  const { RecallReviewStore } = loadPlugin();
+  const { adapter, store } = await loadedStore(RecallReviewStore, {
+    "a.md": { k1: reviewRecord({ at: 100 }), k2: reviewRecord({ at: 100 }) },
+  });
+
+  adapter.files.set(REVIEW_STATE_PATH, reviewStateText({
+    "a.md": {
+      k1: reviewRecord({ at: 200, reps: 7 }),
+      k2: reviewRecord({ at: 50, reps: 9 }),
+      k4: reviewRecord({ at: 200 }),
+    },
+    "b.md": { k5: reviewRecord({ at: 200 }) },
+  }));
+  store.rate("a.md", "k2", "good", "2026-10-15", 300);
+  store.rate("a.md", "k3", "good", "2026-10-15", 300);
+  assert.equal((await store.save()).ok, true);
+
+  const files = savedFiles(adapter);
+  assert.equal(files["a.md"].k1.reps, 7);
+  assert.equal(files["a.md"].k2.at, 300);
+  assert.ok(files["a.md"].k3);
+  assert.ok(files["a.md"].k4);
+  assert.ok(files["b.md"].k5);
+});
+
+test("overlapping saves are serialized and keep every rating", async () => {
+  const { RecallReviewStore } = loadPlugin();
+  const { adapter, store } = await loadedStore(RecallReviewStore);
+
+  store.rate("a.md", "k1", "good", "2026-10-15", 500);
+  const first = store.save();
+  store.rate("a.md", "k2", "hard", "2026-10-15", 600);
+  const second = store.save();
+  const results = await Promise.all([first, second]);
+
+  assert.ok(results.every((result) => result.ok));
+  const files = savedFiles(adapter);
+  assert.ok(files["a.md"].k1);
+  assert.ok(files["a.md"].k2);
+});
+
+test("renaming a note or folder moves its review records", async () => {
+  const { RecallReviewStore } = loadPlugin();
+  const { store } = await loadedStore(RecallReviewStore, {
+    "old/a.md": { k1: reviewRecord({ at: 100 }) },
+    "old/sub/b.md": { k2: reviewRecord() },
+    "older/c.md": { k3: reviewRecord() },
+    "x.md": { k1: reviewRecord({ at: 50, reps: 4 }), k9: reviewRecord() },
+  });
+
+  assert.equal(store.renamePath("old", "new"), true);
+  assert.equal(store.get("old/a.md", "k1"), null);
+  assert.equal(store.get("new/a.md", "k1").at, 100);
+  assert.ok(store.get("new/sub/b.md", "k2"));
+  assert.ok(store.get("older/c.md", "k3"));
+
+  // Moving onto a path that already has records keeps the newer record per card.
+  assert.equal(store.renamePath("new/a.md", "x.md"), true);
+  assert.equal(store.get("x.md", "k1").at, 100);
+  assert.ok(store.get("x.md", "k9"));
+  assert.equal(store.renamePath("missing.md", "y.md"), false);
+});
+
+test("today's queue puts overdue cards first and caps new cards by today's remaining quota", async () => {
+  const { RecallReviewStore, buildDueReviewQueue } = loadPlugin();
+  const { store } = await loadedStore(RecallReviewStore, {
+    "a.md": {
+      today: reviewRecord({ due: "2026-10-15" }),
+      overdue: reviewRecord({ due: "2026-10-10" }),
+      later: reviewRecord({ due: "2026-10-18", first: "2026-10-15" }),
+    },
+    "gone.md": { orphan: reviewRecord({ due: "2026-10-01" }) },
+  });
+  const card = (key, filePath = "a.md") => ({ key, filePath, prompt: key, answer: key });
+  const cards = [card("today"), card("later"), card("overdue"), card("n1"), card("n2"), card("n3", "b.md")];
+
+  const queue = buildDueReviewQueue(cards, store, "2026-10-15", { newLimit: 2, random: () => 0 });
+
+  assert.deepEqual(Array.from(queue.slice(0, 2), (c) => c.key), ["overdue", "today"]);
+  // "later" was introduced today, so only one of the two daily new-card slots is left.
+  assert.equal(queue.length, 3);
+  assert.ok(["n1", "n2", "n3"].includes(queue[2].key));
+  assert.equal(buildDueReviewQueue(cards, store, "2026-10-15", { newLimit: 0 }).length, 2);
+});
+
+test("the review modal reports each rating and shows the next interval on each button", () => {
+  const { ReviewModal } = loadPlugin();
+  const rated = [];
+  const card = { key: "k1", filePath: "a.md", prompt: "Q", answer: "A", typeName: "问答 / 概念卡" };
+  const modal = new ReviewModal({}, [card], "title", {
+    onRate: (ratedCard, rating) => rated.push([ratedCard.key, rating]),
+    getIntervals: () => ({ again: 1, hard: 2, good: 45 }),
+  });
+  modal.contentEl = new FakeElement();
+  modal.isFlipped = true;
+  modal.renderCard();
+
+  const labels = modal.contentEl.querySelectorAll(".crisp-recall-grade-btn__interval").map((el) => el.textContent);
+  assert.deepEqual(labels, ["明天", "2 天", "1.5 个月"]);
+
+  modal.renderSummary = () => {};
+  modal.rateCard("hard");
+  assert.deepEqual(rated, [["k1", "hard"]]);
+});
+
+test("plugin ratings persist to the review store", async () => {
+  const { PluginClass, RecallReviewStore } = loadPlugin();
+  const { adapter, store } = await loadedStore(RecallReviewStore);
+  const plugin = new PluginClass({});
+  plugin.reviewStore = store;
+
+  await plugin.recordReviewRating({ key: "k1", filePath: "a.md" }, "good");
+
+  assert.ok(savedFiles(adapter)["a.md"].k1);
+});
+
+test("vault rename events move review records and save them", async () => {
+  const { PluginClass, RecallReviewStore } = loadPlugin();
+  const { adapter, store } = await loadedStore(RecallReviewStore, { "old.md": { k1: reviewRecord() } });
+  const plugin = new PluginClass({});
+  plugin.reviewStore = store;
+
+  await plugin.handleVaultRename({ path: "new.md" }, "old.md");
+
+  const files = savedFiles(adapter);
+  assert.equal(files["old.md"], undefined);
+  assert.ok(files["new.md"].k1);
+});
+
+function makeReviewPlugin(PluginClass, fileContents, store) {
+  const files = Object.keys(fileContents).map((filePath) => ({ path: filePath, basename: filePath.replace(/\.md$/, "") }));
+  const plugin = new PluginClass({
+    vault: {
+      getMarkdownFiles: () => files,
+      getFileByPath: (filePath) => files.find((file) => file.path === filePath) || null,
+      async cachedRead(file) {
+        return fileContents[file.path];
+      },
+    },
+  });
+  plugin.settings = { enableCloze: true, enableDoubleColon: true, enableFloatingPill: true, newCardsPerDay: 0 };
+  plugin.licenseState = { valid: true, payload: { product: "Crisp Suite" } };
+  plugin.reviewStore = store;
+  const opened = [];
+  plugin.openReviewModal = (cards, title) => opened.push({ cards, title });
+  return { plugin, opened };
+}
+
+test("the due review command opens only cards that are due today", async () => {
+  const { PluginClass, RecallReviewStore, parseFlashcardsFromText } = loadPlugin();
+  const dueKey = parseFlashcardsFromText("Due :: Yes")[0].key;
+  const laterKey = parseFlashcardsFromText("Later :: Yes")[0].key;
+  const { store } = await loadedStore(RecallReviewStore, {
+    "a.md": { [dueKey]: reviewRecord({ due: "2000-01-01" }), [laterKey]: reviewRecord({ due: "2999-01-01" }) },
+  });
+  const { plugin, opened } = makeReviewPlugin(PluginClass, {
+    "a.md": "Due :: Yes\nLater :: Yes\nNew :: Card",
+  }, store);
+
+  await plugin.startDueReview();
+
+  assert.equal(opened.length, 1);
+  assert.deepEqual(Array.from(opened[0].cards, (card) => card.prompt), ["Due"]);
+});
+
+test("the due review command explains when nothing is due", async () => {
+  const { PluginClass, RecallReviewStore, notices } = loadPlugin();
+  const { store } = await loadedStore(RecallReviewStore);
+  const { plugin, opened } = makeReviewPlugin(PluginClass, { "a.md": "New :: Card" }, store);
+
+  await plugin.startDueReview();
+
+  assert.equal(opened.length, 0);
+  assert.ok(notices.some((message) => message.includes("今天没有到期")));
+});
+
+test("the floating controller shows due cards for the note and reviews only them", async () => {
+  const { PluginClass, RecallReviewStore, parseFlashcardsFromText } = loadPlugin();
+  const dueKey = parseFlashcardsFromText("Due :: Yes")[0].key;
+  const { store } = await loadedStore(RecallReviewStore, { "a.md": { [dueKey]: reviewRecord({ due: "2000-01-01" }) } });
+  const { plugin, opened } = makeReviewPlugin(PluginClass, {
+    "a.md": "Due :: Yes\nNew :: Card",
+    "b.md": "New :: Card",
+  }, store);
+  const container = new FakeElement("workspace-leaf-content");
+
+  await plugin.injectFloatingWidget(container, "a.md");
+  const due = container.querySelector(".crisp-recall-pill-due");
+  assert.equal(due.textContent, "到期 1");
+  due.onclick({ stopPropagation() {} });
+  assert.deepEqual(Array.from(opened[0].cards, (card) => card.prompt), ["Due"]);
+
+  const other = new FakeElement("workspace-leaf-content");
+  await plugin.injectFloatingWidget(other, "b.md");
+  assert.ok(other.querySelector(".crisp-recall-floating-pill"));
+  assert.equal(other.querySelector(".crisp-recall-pill-due"), null);
 });

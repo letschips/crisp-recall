@@ -1,0 +1,34 @@
+{
+  "_source": "ts-fsrs 4.7.1 (FSRS-5 default weights), enable_short_term=false, enable_fuzz=false, request_retention=0.9",
+  "sequences": {
+    "steady": [
+      {"rating":"good","day":0,"ivl":3,"s":3.173,"d":5.28243442,"reps":1,"lapses":0,"preview":[1,2,3]},
+      {"rating":"good","day":3,"ivl":11,"s":10.73892592,"d":5.27296793,"reps":2,"lapses":0,"preview":[1,5,11]},
+      {"rating":"good","day":14,"ivl":35,"s":34.57762416,"d":5.26354498,"reps":3,"lapses":0,"preview":[2,16,35]},
+      {"rating":"hard","day":49,"ivl":50,"s":49.89613825,"d":6.01919873,"reps":4,"lapses":0,"preview":[4,50,101]},
+      {"rating":"again","day":99,"ivl":4,"s":4.3982576,"d":7.29230308,"reps":5,"lapses":1,"preview":[4,68,129]},
+      {"rating":"good","day":103,"ivl":11,"s":10.71336374,"d":7.27359119,"reps":6,"lapses":1,"preview":[1,6,11]}
+    ],
+    "rough": [
+      {"rating":"again","day":0,"ivl":1,"s":0.40255,"d":7.1949,"reps":1,"lapses":0,"preview":[1,2,3]},
+      {"rating":"hard","day":1,"ivl":2,"s":0.83370935,"d":7.6297166,"reps":2,"lapses":0,"preview":[1,2,3]},
+      {"rating":"good","day":3,"ivl":4,"s":3.88064404,"d":7.60945261,"reps":3,"lapses":0,"preview":[1,2,4]},
+      {"rating":"good","day":7,"ivl":10,"s":9.67096172,"d":7.58928184,"reps":4,"lapses":0,"preview":[1,5,10]}
+    ],
+    "sameDay": [
+      {"rating":"hard","day":0,"ivl":2,"s":1.18385,"d":6.48830527,"reps":1,"lapses":0,"preview":[1,2,3]},
+      {"rating":"good","day":0,"ivl":3,"s":1.18385,"d":6.47329177,"reps":2,"lapses":0,"preview":[1,2,3]},
+      {"rating":"again","day":0,"ivl":1,"s":0.41087759,"d":7.59761686,"reps":3,"lapses":1,"preview":[1,2,3]},
+      {"rating":"good","day":1,"ivl":3,"s":2.07924958,"d":7.57750053,"reps":4,"lapses":1,"preview":[1,2,3]}
+    ],
+    "early": [
+      {"rating":"good","day":0,"ivl":3,"s":3.173,"d":5.28243442,"reps":1,"lapses":0,"preview":[1,2,3]},
+      {"rating":"good","day":1,"ivl":6,"s":5.86914185,"d":5.27296793,"reps":2,"lapses":0,"preview":[1,4,6]},
+      {"rating":"good","day":2,"ivl":8,"s":8.41985643,"d":5.26354498,"reps":3,"lapses":0,"preview":[1,6,8]}
+    ],
+    "overdue": [
+      {"rating":"good","day":0,"ivl":3,"s":3.173,"d":5.28243442,"reps":1,"lapses":0,"preview":[1,2,3]},
+      {"rating":"good","day":30,"ivl":45,"s":45.44565655,"d":5.27296793,"reps":2,"lapses":0,"preview":[2,13,45]}
+    ]
+  }
+}

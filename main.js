@@ -39,8 +39,14 @@ const DEFAULT_SETTINGS = {
   clozeDelimiter: "==",
   autoMaskInReadingView: true,
   clozeColor: "",
+  newCardsPerDay: 20,
   licenseCode: "",
 };
+
+function sanitizeNewCardsPerDay(value) {
+  const count = Number(value);
+  return Number.isInteger(count) && count >= 0 && count <= 9999 ? count : DEFAULT_SETTINGS.newCardsPerDay;
+}
 
 const CRISP_LICENSE_VERIFY_URL = "https://license.letschips.xyz/api/verify-device";
 const CRISP_PUBLIC_KEY_PEM = `-----BEGIN PUBLIC KEY-----
@@ -523,6 +529,7 @@ function parseFlashcardsFromText(text, filePath = "", options = {}) {
         cards.push({
           id: `${filePath}:${i}:concept:reverse`,
           type: "concept",
+          isReverse: true,
           typeName: "双向概念卡",
           prompt: doubleColonCard.answer,
           answer: doubleColonCard.prompt,
@@ -577,17 +584,404 @@ function parseFlashcardsFromText(text, filePath = "", options = {}) {
     }
   }
 
+  assignCardKeys(cards);
   return cards;
+}
+
+// --------------------------------------------------------------------------
+// 1b. Spaced repetition: content keys, FSRS-5 scheduling, review-state.json
+// --------------------------------------------------------------------------
+
+// cyrb53: a small 53-bit string hash that needs no Node or WebCrypto, so it also runs on mobile.
+function cyrb53(str, seed = 0) {
+  let h1 = 0xdeadbeef ^ seed;
+  let h2 = 0x41c6ce57 ^ seed;
+  for (let i = 0; i < str.length; i++) {
+    const ch = str.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507);
+  h1 ^= Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507);
+  h2 ^= Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return 4294967296 * (2097151 & h2) + (h1 >>> 0);
+}
+
+function normalizeCardText(text) {
+  return String(text ?? "").normalize("NFC").replace(/\s+/g, " ").trim();
+}
+
+/** Keys depend on card content only, so inserting lines above a card keeps its review history. */
+function assignCardKeys(cards) {
+  const seen = new Map();
+  for (const card of cards) {
+    const kind = card.isReverse ? `${card.type}-reverse` : card.type;
+    const base = cyrb53(`${kind}\u0000${normalizeCardText(card.prompt)}\u0000${normalizeCardText(card.answer)}`).toString(36);
+    const occurrence = (seen.get(base) || 0) + 1;
+    seen.set(base, occurrence);
+    card.key = occurrence === 1 ? base : `${base}#${occurrence}`;
+  }
+  return cards;
+}
+
+// Review days are local calendar dates ("YYYY-MM-DD"); a new day starts at local midnight.
+function recallDateKey(date = new Date()) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+function recallKeyToUtc(key) {
+  const [year, month, day] = String(key).split("-").map(Number);
+  return Date.UTC(year, month - 1, day);
+}
+
+function recallDayDiff(fromKey, toKey) {
+  return Math.round((recallKeyToUtc(toKey) - recallKeyToUtc(fromKey)) / 86400000);
+}
+
+function recallAddDays(key, days) {
+  const date = new Date(recallKeyToUtc(key) + days * 86400000);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}`;
+}
+
+// FSRS-5 with its default weights and 90% desired retention, scheduled in whole days. Mirrors the
+// long-term scheduler of ts-fsrs 4.x (enable_short_term: false, no fuzz); tests replay its output.
+const RECALL_FSRS_WEIGHTS = Object.freeze([
+  0.40255, 1.18385, 3.173, 15.69105, 7.1949, 0.5345, 1.4604, 0.0046, 1.54575, 0.1192,
+  1.01925, 1.9395, 0.11, 0.29605, 2.2698, 0.2315, 2.9898, 0.51655, 0.6621,
+]);
+const RECALL_FSRS_DECAY = -0.5;
+const RECALL_FSRS_FACTOR = 19 / 81;
+const RECALL_FSRS_RETENTION = 0.9;
+const RECALL_FSRS_MAX_INTERVAL = 36500;
+const RECALL_FSRS_S_MIN = 0.01;
+const RECALL_FSRS_INTERVAL_MODIFIER = +(
+  (Math.pow(RECALL_FSRS_RETENTION, 1 / RECALL_FSRS_DECAY) - 1) / RECALL_FSRS_FACTOR
+).toFixed(8);
+const RECALL_RATING_GRADES = Object.freeze({ again: 1, hard: 2, good: 3 });
+const RECALL_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
+const fsrsRound = (value) => +value.toFixed(8);
+const fsrsClamp = (value, min, max) => Math.min(Math.max(value, min), max);
+
+function fsrsConstrainDifficulty(difficulty) {
+  return Math.min(Math.max(fsrsRound(difficulty), 1), 10);
+}
+
+function fsrsInitDifficulty(grade) {
+  const w = RECALL_FSRS_WEIGHTS;
+  return fsrsConstrainDifficulty(w[4] - Math.exp((grade - 1) * w[5]) + 1);
+}
+
+function fsrsNextDifficulty(difficulty, grade) {
+  const w = RECALL_FSRS_WEIGHTS;
+  const delta = -w[6] * (grade - 3);
+  const damped = difficulty + fsrsRound((delta * (10 - difficulty)) / 9);
+  return fsrsConstrainDifficulty(fsrsRound(w[7] * fsrsInitDifficulty(4) + (1 - w[7]) * damped));
+}
+
+function fsrsRetrievability(elapsedDays, stability) {
+  return fsrsRound(Math.pow(1 + (RECALL_FSRS_FACTOR * elapsedDays) / stability, RECALL_FSRS_DECAY));
+}
+
+function fsrsRecallStability(difficulty, stability, retrievability, grade) {
+  const w = RECALL_FSRS_WEIGHTS;
+  const hardPenalty = grade === RECALL_RATING_GRADES.hard ? w[15] : 1;
+  const growth = Math.exp(w[8]) * (11 - difficulty) * Math.pow(stability, -w[9])
+    * (Math.exp((1 - retrievability) * w[10]) - 1) * hardPenalty;
+  return fsrsRound(fsrsClamp(stability * (1 + growth), RECALL_FSRS_S_MIN, 36500));
+}
+
+function fsrsForgetStability(difficulty, stability, retrievability) {
+  const w = RECALL_FSRS_WEIGHTS;
+  return fsrsRound(fsrsClamp(
+    w[11] * Math.pow(difficulty, -w[12]) * (Math.pow(stability + 1, w[13]) - 1) * Math.exp((1 - retrievability) * w[14]),
+    RECALL_FSRS_S_MIN,
+    36500,
+  ));
+}
+
+function fsrsInterval(stability) {
+  return Math.min(Math.max(1, Math.round(stability * RECALL_FSRS_INTERVAL_MODIFIER)), RECALL_FSRS_MAX_INTERVAL);
+}
+
+function isValidRecallRecord(record) {
+  return !!record && typeof record === "object"
+    && Number.isFinite(record.s) && record.s >= RECALL_FSRS_S_MIN
+    && Number.isFinite(record.d) && record.d >= 1 && record.d <= 10
+    && RECALL_DATE_PATTERN.test(record.due) && RECALL_DATE_PATTERN.test(record.last)
+    && Number.isInteger(record.reps) && record.reps >= 0;
+}
+
+/** Memory state and interval in days for each rating, after enforcing again < hard < good. */
+function fsrsNextStates(record, today) {
+  const states = {};
+  if (!isValidRecallRecord(record)) {
+    for (const [rating, grade] of Object.entries(RECALL_RATING_GRADES)) {
+      states[rating] = { s: Math.max(RECALL_FSRS_WEIGHTS[grade - 1], 0.1), d: fsrsInitDifficulty(grade) };
+    }
+  } else {
+    const elapsed = Math.max(0, recallDayDiff(record.last, today));
+    const r = fsrsRetrievability(elapsed, record.s);
+    states.again = {
+      s: fsrsClamp(fsrsRound(record.s), RECALL_FSRS_S_MIN, fsrsForgetStability(record.d, record.s, r)),
+      d: fsrsNextDifficulty(record.d, RECALL_RATING_GRADES.again),
+    };
+    states.hard = {
+      s: fsrsRecallStability(record.d, record.s, r, RECALL_RATING_GRADES.hard),
+      d: fsrsNextDifficulty(record.d, RECALL_RATING_GRADES.hard),
+    };
+    states.good = {
+      s: fsrsRecallStability(record.d, record.s, r, RECALL_RATING_GRADES.good),
+      d: fsrsNextDifficulty(record.d, RECALL_RATING_GRADES.good),
+    };
+  }
+  let again = fsrsInterval(states.again.s);
+  let hard = fsrsInterval(states.hard.s);
+  let good = fsrsInterval(states.good.s);
+  again = Math.min(again, hard);
+  hard = Math.max(hard, again + 1);
+  good = Math.max(good, hard + 1);
+  states.again.interval = again;
+  states.hard.interval = hard;
+  states.good.interval = good;
+  return states;
+}
+
+function previewRecallIntervals(record, today) {
+  const states = fsrsNextStates(record, today);
+  return { again: states.again.interval, hard: states.hard.interval, good: states.good.interval };
+}
+
+function scheduleRecallReview(record, rating, today, at = Date.now()) {
+  if (!Object.hasOwn(RECALL_RATING_GRADES, rating)) throw new Error(`Unknown rating: ${rating}`);
+  const previous = isValidRecallRecord(record) ? record : null;
+  const next = fsrsNextStates(previous, today)[rating];
+  return {
+    s: next.s,
+    d: next.d,
+    due: recallAddDays(today, next.interval),
+    last: today,
+    at,
+    reps: previous ? previous.reps + 1 : 1,
+    lapses: (Number.isInteger(previous?.lapses) ? previous.lapses : 0) + (previous && rating === "again" ? 1 : 0),
+    first: previous && RECALL_DATE_PATTERN.test(previous.first) ? previous.first : today,
+  };
+}
+
+function formatRecallInterval(days) {
+  const oneDecimal = (value) => String(Math.round(value * 10) / 10);
+  if (days <= 1) return "明天";
+  if (days < 30) return `${days} 天`;
+  if (days < 365) return `${oneDecimal(days / 30)} 个月`;
+  return `${oneDecimal(days / 365)} 年`;
+}
+
+const RECALL_REVIEW_STATE_VERSION = 1;
+
+function isPlainRecord(value) {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function parseRecallReviewState(text) {
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!isPlainRecord(parsed) || !Number.isInteger(parsed.version) || parsed.version < 1) return null;
+  if (!isPlainRecord(parsed.files) || !Object.values(parsed.files).every(isPlainRecord)) return null;
+  return { version: parsed.version, files: parsed.files };
+}
+
+/** Copies records from source into target; per card, the record reviewed later wins. */
+function mergeRecallRecords(target, source) {
+  for (const [key, record] of Object.entries(source)) {
+    const current = Object.hasOwn(target, key) ? target[key] : null;
+    if (!current || (Number(record?.at) || 0) > (Number(current?.at) || 0)) target[key] = record;
+  }
+  return target;
+}
+
+/**
+ * Review records live in their own file so frequent review writes never touch the license and settings
+ * in data.json. Like data.json, an unreadable file is copied aside before anything replaces it, and
+ * every write is read back because a vault adapter write can fail without throwing.
+ */
+class RecallReviewStore {
+  constructor(adapter, filePath) {
+    this.adapter = adapter;
+    this.filePath = filePath;
+    this.files = {};
+    this.diskText = null;
+    this.writeBlocked = false;
+    this.blockReason = null;
+    this.backedUp = false;
+    this.saveQueue = Promise.resolve();
+  }
+
+  async load() {
+    let text;
+    try {
+      if (!this.adapter) throw new Error("vault adapter unavailable");
+      if (!(await this.adapter.exists(this.filePath))) return { state: "missing" };
+      text = await this.adapter.read(this.filePath);
+    } catch (error) {
+      return this.preserveUnreadable(error);
+    }
+    const parsed = parseRecallReviewState(text);
+    if (!parsed) return this.preserveUnreadable(null, text);
+    this.files = parsed.files;
+    this.diskText = text;
+    if (parsed.version > RECALL_REVIEW_STATE_VERSION) {
+      this.block("newer");
+      return { state: "newer" };
+    }
+    return { state: "loaded" };
+  }
+
+  async preserveUnreadable(readError, text = null) {
+    const result = await preserveUnreadableData(this.adapter, this.filePath);
+    if (result.state === "preserved") {
+      // The unreadable original now has a copy, so the next save may replace it.
+      this.diskText = text;
+      this.backedUp = true;
+      return result;
+    }
+    this.block("unreadable");
+    return { state: "failed", error: result.error || readError };
+  }
+
+  block(reason) {
+    this.writeBlocked = true;
+    this.blockReason = reason;
+  }
+
+  get(filePath, key) {
+    const records = Object.hasOwn(this.files, filePath) ? this.files[filePath] : null;
+    const record = records && Object.hasOwn(records, key) ? records[key] : null;
+    return isValidRecallRecord(record) ? record : null;
+  }
+
+  rate(filePath, key, rating, today, at = Date.now()) {
+    const record = scheduleRecallReview(this.get(filePath, key), rating, today, at);
+    if (!Object.hasOwn(this.files, filePath)) this.files[filePath] = {};
+    this.files[filePath][key] = record;
+    return record;
+  }
+
+  countIntroducedOn(today) {
+    let count = 0;
+    for (const records of Object.values(this.files)) {
+      for (const record of Object.values(records)) {
+        if (record?.first === today) count++;
+      }
+    }
+    return count;
+  }
+
+  /** Moves records for a renamed note, or for every note under a renamed folder. */
+  renamePath(oldPath, newPath) {
+    if (!oldPath || !newPath || oldPath === newPath) return false;
+    const moved = Object.keys(this.files).filter((filePath) =>
+      filePath === oldPath || filePath.startsWith(`${oldPath}/`)
+    );
+    for (const filePath of moved) {
+      const target = `${newPath}${filePath.slice(oldPath.length)}`;
+      if (!Object.hasOwn(this.files, target)) this.files[target] = {};
+      mergeRecallRecords(this.files[target], this.files[filePath]);
+      delete this.files[filePath];
+    }
+    return moved.length > 0;
+  }
+
+  /** Saves are queued so two writes never interleave; each one writes the whole current state. */
+  save() {
+    const run = this.saveQueue.then(() => this.writeNow());
+    this.saveQueue = run.catch(() => {});
+    return run;
+  }
+
+  async writeNow() {
+    if (this.writeBlocked) return { ok: false, reason: this.blockReason };
+    try {
+      const adapter = this.adapter;
+      if (await adapter.exists(this.filePath)) {
+        const disk = await adapter.read(this.filePath);
+        if (disk !== this.diskText) {
+          // Another device (or a sync conflict) changed the file since we last read or wrote it.
+          const parsed = parseRecallReviewState(disk);
+          if (!parsed) {
+            const result = await preserveUnreadableData(adapter, this.filePath);
+            if (result.state !== "preserved") return { ok: false, error: result.error };
+          } else if (parsed.version > RECALL_REVIEW_STATE_VERSION) {
+            this.block("newer");
+            return { ok: false, reason: "newer" };
+          } else {
+            for (const [filePath, records] of Object.entries(parsed.files)) {
+              if (!Object.hasOwn(this.files, filePath)) this.files[filePath] = {};
+              mergeRecallRecords(this.files[filePath], records);
+            }
+          }
+        }
+        if (!this.backedUp) {
+          const backupPath = `${this.filePath}.bak`;
+          await adapter.write(backupPath, disk);
+          if ((await adapter.read(backupPath)) !== disk) {
+            return { ok: false, error: new Error("review-state.json.bak did not read back") };
+          }
+          this.backedUp = true;
+        }
+      }
+      const text = JSON.stringify({
+        version: RECALL_REVIEW_STATE_VERSION,
+        algorithm: "fsrs-5",
+        files: this.files,
+      });
+      await adapter.write(this.filePath, text);
+      if ((await adapter.read(this.filePath)) !== text) {
+        return { ok: false, error: new Error("review-state.json did not read back") };
+      }
+      this.diskText = text;
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error };
+    }
+  }
+}
+
+/** Due cards (most overdue first), then as many new cards as today's new-card quota allows. */
+function buildDueReviewQueue(cards, store, today, { newLimit = 20, random = Math.random } = {}) {
+  const due = [];
+  const fresh = [];
+  for (const card of cards) {
+    const record = store?.get(card.filePath, card.key);
+    if (!record) fresh.push(card);
+    else if (record.due <= today) due.push({ card, due: record.due });
+  }
+  due.sort((a, b) => (a.due < b.due ? -1 : a.due > b.due ? 1 : 0));
+
+  const quota = Math.max(0, newLimit - (store?.countIntroducedOn(today) || 0));
+  for (let i = fresh.length - 1; i > 0; i--) {
+    const j = Math.floor(random() * (i + 1));
+    [fresh[i], fresh[j]] = [fresh[j], fresh[i]];
+  }
+  return [...due.map((entry) => entry.card), ...fresh.slice(0, quota)];
 }
 
 // --------------------------------------------------------------------------
 // 2. 3D Zen Flashcard Review Modal
 // --------------------------------------------------------------------------
 class CrispRecallReviewModal extends Modal {
-  constructor(app, cards, title = "Crisp Recall 抽认练习") {
+  constructor(app, cards, title = "Crisp Recall 抽认练习", { onRate = null, getIntervals = null } = {}) {
     super(app);
     this.cards = cards;
     this.sessionTitle = title;
+    this.onRate = onRate;
+    this.getIntervals = getIntervals;
     this.currentIndex = 0;
     this.isFlipped = false;
     this.isComplete = false;
@@ -651,6 +1045,11 @@ class CrispRecallReviewModal extends Modal {
 
   rateCard(rating) {
     if (this.isComplete || !this.isFlipped || !Object.hasOwn(this.stats, rating)) return;
+    try {
+      this.onRate?.(this.cards[this.currentIndex], rating);
+    } catch (error) {
+      console.error("Crisp Recall could not record a rating", error);
+    }
     this.stats[rating]++;
     this.currentIndex++;
     this.isFlipped = false;
@@ -742,19 +1141,33 @@ class CrispRecallReviewModal extends Modal {
       flipBtn.onclick = () => this.toggleFlip();
     } else {
       const gradingGroup = this.footerEl.createDiv("crisp-recall-grading-group");
+      let intervals = null;
+      try {
+        intervals = this.getIntervals?.(this.cards[this.currentIndex]) || null;
+      } catch (error) {
+        console.error("Crisp Recall could not preview review intervals", error);
+      }
+      const addInterval = (button, rating) => {
+        if (Number.isFinite(intervals?.[rating])) {
+          button.createSpan({ cls: "crisp-recall-grade-btn__interval", text: formatRecallInterval(intervals[rating]) });
+        }
+      };
 
       const againBtn = gradingGroup.createEl("button", { cls: "crisp-recall-grade-btn crisp-recall-grade-btn--again" });
       againBtn.createSpan({ text: "🔴 没记住" });
+      addInterval(againBtn, "again");
       againBtn.createSpan({ cls: "crisp-recall-grade-btn__key", text: "按 1" });
       againBtn.onclick = () => this.rateCard("again");
 
       const hardBtn = gradingGroup.createEl("button", { cls: "crisp-recall-grade-btn crisp-recall-grade-btn--hard" });
       hardBtn.createSpan({ text: "🟡 有点犹豫" });
+      addInterval(hardBtn, "hard");
       hardBtn.createSpan({ cls: "crisp-recall-grade-btn__key", text: "按 2" });
       hardBtn.onclick = () => this.rateCard("hard");
 
       const goodBtn = gradingGroup.createEl("button", { cls: "crisp-recall-grade-btn crisp-recall-grade-btn--good" });
       goodBtn.createSpan({ text: "🟢 轻松记下" });
+      addInterval(goodBtn, "good");
       goodBtn.createSpan({ cls: "crisp-recall-grade-btn__key", text: "按 3" });
       goodBtn.onclick = () => this.rateCard("good");
     }
@@ -843,7 +1256,10 @@ class CrispRecallPlugin extends Plugin {
       clozeColor: typeof storedSettings?.clozeColor === "string"
         ? storedSettings.clozeColor.trim()
         : "",
+      newCardsPerDay: sanitizeNewCardsPerDay(storedSettings?.newCardsPerDay ?? DEFAULT_SETTINGS.newCardsPerDay),
     });
+    this.reviewStore = new RecallReviewStore(this.app?.vault?.adapter, `${this.manifest?.dir}/review-state.json`);
+    this.reportReviewStoreLoad(await this.reviewStore.load());
     this.licenseState = { valid: false, payload: null, reason: "尚未输入 Crisp 授权码" };
     await this.refreshLicenseState({ online: false });
     this.applyCustomColor();
@@ -864,6 +1280,12 @@ class CrispRecallPlugin extends Plugin {
       id: "start-vault-random-review",
       name: "Start random flashcard review across vault (全库随机抽认自测)",
       callback: () => this.startVaultRandomReview(),
+    });
+
+    this.addCommand({
+      id: "start-due-review",
+      name: "Review cards due today (今日到期复习)",
+      callback: () => this.startDueReview(),
     });
 
     this.addCommand({
@@ -913,6 +1335,13 @@ class CrispRecallPlugin extends Plugin {
       })
     );
 
+    // Review records follow notes and folders that are renamed or moved inside Obsidian.
+    this.registerEvent(
+      this.app.vault.on("rename", (file, oldPath) => {
+        this.handleVaultRename(file, oldPath);
+      })
+    );
+
     // 5. Register selection events in the main window and every Obsidian popout.
     if (typeof this.registerDomEvent === "function") {
       const mainDocument = this.app.workspace?.containerEl?.ownerDocument
@@ -955,10 +1384,49 @@ class CrispRecallPlugin extends Plugin {
     console.log("Crisp Recall Plugin unloaded.");
   }
 
+  reportReviewStoreLoad(result) {
+    if (result.state === "preserved") {
+      new Notice(`Crisp Recall 的复习记录无法读取，已备份为 ${result.backupPath.split("/").pop()}，复习进度从空白开始。`, 12000);
+    } else if (result.state === "failed") {
+      console.error("Crisp Recall could not back up unreadable review-state.json", result.error);
+      new Notice("Crisp Recall 的复习记录无法读取，也无法备份。为保护原文件，本次运行不会保存复习进度。", 0);
+    } else if (result.state === "newer") {
+      new Notice("Crisp Recall 的复习记录由更新版本的插件写入。本次运行只读取、不保存复习进度，请升级 Crisp Recall。", 0);
+    }
+  }
+
+  async saveReviewState() {
+    if (!this.reviewStore) return { ok: false };
+    const result = await this.reviewStore.save();
+    if (result.ok) {
+      this.reviewSaveWarned = false;
+    } else if (!result.reason && !this.reviewSaveWarned) {
+      // Blocked stores were already reported on load; a failed write is reported once until one succeeds.
+      this.reviewSaveWarned = true;
+      console.error("Crisp Recall could not save review-state.json", result.error);
+      new Notice("Crisp Recall 复习记录未能保存，下一次评分时会重试。", 8000);
+    }
+    return result;
+  }
+
+  recordReviewRating(card, rating) {
+    if (!this.reviewStore || !card?.key || !card.filePath) return Promise.resolve({ ok: false });
+    this.reviewStore.rate(card.filePath, card.key, rating, recallDateKey(), Date.now());
+    return this.saveReviewState();
+  }
+
+  async handleVaultRename(file, oldPath) {
+    if (!this.reviewStore?.renamePath(oldPath, file?.path)) return;
+    await this.saveReviewState();
+  }
+
   openReviewModal(cards, title) {
     if (this.unloaded || !this.ensureLicenseActivated()) return;
     this.hideSelectionBubble();
-    const modal = new CrispRecallReviewModal(this.app, cards, title);
+    const modal = new CrispRecallReviewModal(this.app, cards, title, {
+      onRate: (card, rating) => this.recordReviewRating(card, rating),
+      getIntervals: (card) => previewRecallIntervals(this.reviewStore?.get(card.filePath, card.key) || null, recallDateKey()),
+    });
     if (!this.reviewModals) this.reviewModals = new Set();
     this.reviewModals.add(modal);
 
@@ -968,6 +1436,8 @@ class CrispRecallPlugin extends Plugin {
         originalOnClose();
       } finally {
         this.reviewModals.delete(modal);
+        // Ratings change how many cards are due in each open note.
+        if (!this.unloaded) this.updateActiveLeafFloatingWidget(null, { forceAll: true });
       }
     };
     modal.open();
@@ -1516,6 +1986,19 @@ class CrispRecallPlugin extends Plugin {
       badge.createSpan({ text: "⚡ Recall" });
       badge.createSpan({ cls: "crisp-recall-pill-count", text: `${cards.length}` });
 
+      const today = recallDateKey();
+      const dueCards = buildDueReviewQueue(cards, this.reviewStore, today, { newLimit: 0 });
+      if (dueCards.length > 0) {
+        const dueBtn = pill.createEl("button", {
+          cls: "crisp-recall-pill-btn crisp-recall-pill-due",
+          text: `到期 ${dueCards.length}`,
+        });
+        dueBtn.onclick = (event) => {
+          event.stopPropagation();
+          this.openReviewModal(dueCards, `${file.basename} · 到期复习`);
+        };
+      }
+
       const toggleBtn = pill.createEl("button", { cls: "crisp-recall-pill-btn", text: "👁️ 翻转全部" });
       toggleBtn.onclick = (event) => {
         event.stopPropagation();
@@ -1576,6 +2059,40 @@ class CrispRecallPlugin extends Plugin {
 
   async startVaultRandomReview() {
     if (this.unloaded || !this.ensureLicenseActivated()) return;
+    const allCards = await this.scanVaultCards();
+    if (!allCards) return;
+
+    // Fisher-Yates shuffle avoids the bias of Array.sort(() => Math.random() - 0.5).
+    for (let i = allCards.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [allCards[i], allCards[j]] = [allCards[j], allCards[i]];
+    }
+    const shuffled = allCards.slice(0, 20);
+    this.openReviewModal(shuffled, "全库随机抽认");
+  }
+
+  async startDueReview() {
+    if (this.unloaded || !this.ensureLicenseActivated()) return;
+    const allCards = await this.scanVaultCards();
+    if (!allCards) return;
+
+    const today = recallDateKey();
+    const queue = buildDueReviewQueue(allCards, this.reviewStore, today, {
+      newLimit: sanitizeNewCardsPerDay(this.settings?.newCardsPerDay ?? DEFAULT_SETTINGS.newCardsPerDay),
+    });
+    if (queue.length === 0) {
+      const tomorrow = recallAddDays(today, 1);
+      const dueTomorrow = allCards.filter((card) => this.reviewStore?.get(card.filePath, card.key)?.due === tomorrow).length;
+      new Notice(dueTomorrow > 0
+        ? `今天没有到期的卡片，明天有 ${dueTomorrow} 张。`
+        : "今天没有到期的卡片。");
+      return;
+    }
+    this.openReviewModal(queue, "今日到期复习");
+  }
+
+  /** Every card in the vault, or null after the plugin unloads or when the vault has none. */
+  async scanVaultCards() {
     const files = this.app.vault.getMarkdownFiles();
     const allCards = [];
     new Notice("⚡ 正在从全库扫描自测闪卡...");
@@ -1583,7 +2100,7 @@ class CrispRecallPlugin extends Plugin {
     let failedReads = 0;
     const batchSize = 25;
     for (let offset = 0; offset < files.length; offset += batchSize) {
-      if (this.unloaded) return;
+      if (this.unloaded) return null;
       const batch = files.slice(offset, offset + batchSize);
       const results = await Promise.all(batch.map(async (file) => {
         try {
@@ -1598,24 +2115,17 @@ class CrispRecallPlugin extends Plugin {
       results.forEach((cards) => allCards.push(...cards));
     }
 
-    if (this.unloaded) return;
+    if (this.unloaded) return null;
 
     if (allCards.length === 0) {
       new Notice("全库中暂未找到任何自测闪卡，快去笔记中用「::」或「==挖空==」试试吧！");
-      return;
+      return null;
     }
 
     if (failedReads > 0) {
       new Notice(`有 ${failedReads} 篇笔记读取失败，已跳过并继续抽认。`);
     }
-
-    // Fisher-Yates shuffle avoids the bias of Array.sort(() => Math.random() - 0.5).
-    for (let i = allCards.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [allCards[i], allCards[j]] = [allCards[j], allCards[i]];
-    }
-    const shuffled = allCards.slice(0, 20);
-    this.openReviewModal(shuffled, "全库随机抽认");
+    return allCards;
   }
 }
 
@@ -1814,6 +2324,21 @@ class CrispRecallSettingTab extends PluginSettingTab {
           await this.plugin.updateActiveLeafFloatingWidget();
         })
       );
+
+    new Setting(containerEl)
+      .setName("每日新卡上限 (New cards per day)")
+      .setDesc("「今日到期复习」每天最多引入多少张从未复习过的卡片。0 表示只复习已排期的卡片；在当前笔记或全库随机里练过的新卡也计入当天额度。")
+      .addText((text) => {
+        text.inputEl.type = "number";
+        text.inputEl.min = "0";
+        text
+          .setValue(String(this.plugin.settings.newCardsPerDay))
+          .onChange(async (value) => {
+            if (!/^\d+$/.test(value.trim())) return;
+            this.plugin.settings.newCardsPerDay = sanitizeNewCardsPerDay(Number(value.trim()));
+            await this.plugin.saveSettings();
+          });
+      });
 
     new Setting(containerEl)
       .setName("启用划词制卡悬浮气泡 (Selection Floating Toolbar)")

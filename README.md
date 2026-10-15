@@ -9,6 +9,7 @@ Crisp Recall turns ordinary Obsidian Markdown into lightweight active-recall pro
 - Bidirectional cards using `Front ::: Back`.
 - Click-to-reveal answers directly in reading mode.
 - Focused review sessions for the active note or a random vault-wide set.
+- Spaced repetition with FSRS-5: every rating schedules the card's next review, and **Review cards due today** brings back what is due.
 - A compact reading controller for revealing answers or starting practice.
 
 ## Activation
@@ -44,6 +45,7 @@ Crisp Recall 把普通 Markdown 直接变成低摩擦的主动回忆与闪卡练
 - 使用 `正面 ::: 背面` 创建双向卡片。
 - 在阅读模式直接遮罩或揭晓答案。
 - 对当前笔记进行集中练习，或从整个仓库随机抽取闪卡。
+- 基于 FSRS-5 的间隔重复：每次评分都会排好下次复习，用「今日到期复习」命令复习到期卡片。
 - 通过右下角轻量控制器快速翻转或开始抽认。
 
 ## 激活

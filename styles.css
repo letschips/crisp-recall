@@ -154,6 +154,12 @@
   color: #ffffff;
 }
 
+.crisp-recall-pill-due {
+  background: color-mix(in srgb, var(--crisp-recall-cloze-color, var(--interactive-accent)) 15%, transparent);
+  color: var(--crisp-recall-cloze-color, var(--interactive-accent));
+  font-weight: 700;
+}
+
 .crisp-recall-pill-btn--cta {
   background: var(--crisp-recall-cloze-color, var(--interactive-accent));
   color: #ffffff;
@@ -354,6 +360,8 @@
 .crisp-recall-grade-btn {
   flex: 0 1 148px;
   max-width: 148px;
+  /* Obsidian fixes buttons at --input-height; the label, interval and key need three lines. */
+  height: auto;
   padding: 6px 10px;
   border-radius: 9px;
   border: 1px solid var(--background-modifier-border);
@@ -366,6 +374,13 @@
   align-items: center;
   gap: 2px;
   transition: all 0.16s ease;
+}
+
+.crisp-recall-grade-btn__interval {
+  font-size: 0.72rem;
+  font-weight: 500;
+  opacity: 0.85;
+  font-variant-numeric: tabular-nums;
 }
 
 .crisp-recall-grade-btn__key {
