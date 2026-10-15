@@ -1473,3 +1473,135 @@ test("the floating controller shows due cards for the note and reviews only them
   assert.ok(other.querySelector(".crisp-recall-floating-pill"));
   assert.equal(other.querySelector(".crisp-recall-pill-due"), null);
 });
+
+function makeReadingDom(bodyHtml) {
+  const { JSDOM } = require("jsdom");
+  const dom = new JSDOM(`<!doctype html><div class="markdown-preview-section">${bodyHtml}</div>`);
+  // Obsidian's DOM helpers used by the Reading View processor.
+  const proto = dom.window.HTMLElement.prototype;
+  proto.createSpan = function createSpan(cls = "") {
+    const span = this.ownerDocument.createElement("span");
+    if (cls) span.className = cls;
+    this.appendChild(span);
+    return span;
+  };
+  proto.addClass = function addClass(...names) { this.classList.add(...names); };
+  proto.empty = function empty() { this.replaceChildren(); };
+  return { dom, root: dom.window.document.querySelector(".markdown-preview-section") };
+}
+
+function readingPlugin(PluginClass) {
+  const plugin = new PluginClass();
+  plugin.settings = { enableCloze: true, enableDoubleColon: true, enableFloatingPill: false };
+  plugin.licenseState = { valid: true, payload: { product: "Crisp Suite" } };
+  return plugin;
+}
+
+const cardLineSummary = (root) => Array.from(root.querySelectorAll(".crisp-recall-card-line"), (line) => ({
+  prompt: line.querySelector(".crisp-recall-card-line__prompt").textContent,
+  answer: line.querySelector(".crisp-recall-card-line__answer").textContent,
+}));
+
+// Obsidian renders lines without a blank line between them as one <p> joined by <br> soft breaks.
+const softBreakParagraph = "<p dir=\"auto\">Alpha :: One<br>\nBeta ::: <strong>Two</strong> <a class=\"internal-link\" href=\"Welcome\">Welcome</a><br>\nRemember <mark>gamma</mark> here.</p>";
+
+test("reading view masks each soft-broken line as its own card, matching the review parser", () => {
+  const { PluginClass, parseFlashcardsFromText } = loadPlugin();
+  const { root } = makeReadingDom(softBreakParagraph);
+
+  readingPlugin(PluginClass).processMarkdownView(root, {});
+
+  const forwardCards = Array.from(
+    parseFlashcardsFromText("Alpha :: One\nBeta ::: **Two** [[Welcome]]\nRemember ==gamma== here.")
+      .filter((card) => card.type === "concept" && !card.isReverse),
+    ({ prompt }) => prompt,
+  );
+  assert.deepEqual(forwardCards, ["Alpha", "Beta"]);
+  assert.deepEqual(cardLineSummary(root), [
+    { prompt: "Alpha", answer: "One" },
+    { prompt: "Beta", answer: "Two Welcome" },
+  ]);
+  const [, beta] = root.querySelectorAll(".crisp-recall-card-line__answer");
+  assert.ok(beta.querySelector("strong"), "formatting inside a line answer is kept");
+  assert.ok(beta.querySelector("a.internal-link"), "links inside a line answer are kept");
+  const gamma = root.querySelector("mark");
+  assert.ok(!gamma.closest(".crisp-recall-card-line"), "a plain line stays outside every card");
+  assert.ok(gamma.classList.contains("crisp-recall-cloze"), "a highlight on a plain line is still a cloze");
+});
+
+test("soft-broken list items split into one card per line with the bullet in the first card", () => {
+  const { PluginClass } = loadPlugin();
+  const { root } = makeReadingDom(
+    "<ul><li data-line=\"0\" dir=\"auto\"><span class=\"list-bullet\"></span>Item A :: first<br>\nItem B :: second</li></ul>",
+  );
+
+  readingPlugin(PluginClass).processMarkdownView(root, {});
+
+  assert.deepEqual(cardLineSummary(root), [
+    { prompt: "Item A", answer: "first" },
+    { prompt: "Item B", answer: "second" },
+  ]);
+  // Same layout as a single-line card item: the bullet leads the first card, ahead of its prompt.
+  const [first, second] = root.querySelectorAll(".crisp-recall-card-line");
+  assert.ok(first.firstChild.classList.contains("list-bullet"));
+  assert.ok(first.children[1].classList.contains("crisp-recall-card-line__prompt"));
+  assert.equal(second.querySelector(".list-bullet"), null);
+  assert.equal(root.querySelectorAll(".list-bullet").length, 1);
+});
+
+test("soft-broken lines skip code and annotations per line and are processed only once", () => {
+  const { PluginClass } = loadPlugin();
+  const { root } = makeReadingDom(
+    "<p>Use <code>Q :: A</code> to write a card<br>\nNote :: ==marked=={ann note=\"x\"}<br>\nReal :: answer</p>",
+  );
+  const plugin = readingPlugin(PluginClass);
+
+  plugin.processMarkdownView(root, {});
+  plugin.processMarkdownView(root, {});
+
+  assert.deepEqual(cardLineSummary(root), [{ prompt: "Real", answer: "answer" }]);
+  assert.ok(root.querySelector("p > code"), "inline code line is left as written");
+});
+
+test("soft-broken card answers reveal through the delegated click handler", () => {
+  const { PluginClass } = loadPlugin();
+  const { dom, root } = makeReadingDom(softBreakParagraph);
+  const plugin = readingPlugin(PluginClass);
+  plugin.processMarkdownView(root, {});
+
+  const beta = root.querySelectorAll(".crisp-recall-card-line__answer")[1];
+  const event = new dom.window.MouseEvent("click", { bubbles: true, cancelable: true });
+  Object.defineProperty(event, "target", { value: beta.querySelector("a") });
+  plugin.handleClozeClick(event);
+
+  assert.ok(beta.classList.contains("is-revealed"));
+  assert.ok(!root.querySelectorAll(".crisp-recall-card-line__answer")[0].classList.contains("is-revealed"));
+});
+
+test("plugin unload restores soft-broken paragraphs exactly", () => {
+  const { dom, root } = makeReadingDom(softBreakParagraph);
+  // Removing a class leaves an empty class attribute behind, which renders the same.
+  const paragraphHtml = () => root.querySelector("p").innerHTML.replace(/ class=""/g, "");
+  const original = paragraphHtml();
+  const { PluginClass } = loadPlugin({ document: dom.window.document });
+  const plugin = readingPlugin(PluginClass);
+  plugin.processMarkdownView(root, {});
+  assert.notEqual(paragraphHtml(), original);
+
+  plugin.onunload();
+
+  assert.equal(paragraphHtml(), original);
+  assert.equal(root.querySelector("[class*='crisp-recall']"), null);
+});
+
+test("a single-line card paragraph keeps its links and formatting", () => {
+  const { PluginClass } = loadPlugin();
+  const { root } = makeReadingDom("<p>Solo :: <em>single</em> <a class=\"internal-link\" href=\"X\">X</a></p>");
+
+  readingPlugin(PluginClass).processMarkdownView(root, {});
+
+  assert.deepEqual(cardLineSummary(root), [{ prompt: "Solo", answer: "single X" }]);
+  assert.equal(root.querySelector("p").classList.contains("crisp-recall-card-line"), true);
+  assert.ok(root.querySelector(".crisp-recall-card-line__answer em"));
+  assert.ok(root.querySelector(".crisp-recall-card-line__answer a.internal-link"));
+});

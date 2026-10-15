@@ -1727,6 +1727,14 @@ class CrispRecallPlugin extends Plugin {
       doc.querySelectorAll(".crisp-recall-selection-bubble").forEach((bubble) => bubble.remove());
       doc.querySelectorAll(".crisp-recall-floating-pill").forEach((pill) => pill.remove());
 
+      // Paragraphs split into several cards are restored whole, which also removes their card lines.
+      doc.querySelectorAll(".crisp-recall-card-lines").forEach((paragraph) => {
+        const originalHtml = paragraph.dataset.crispRecallOriginalHtml;
+        if (originalHtml !== undefined) paragraph.innerHTML = originalHtml;
+        delete paragraph.dataset.crispRecallOriginalHtml;
+        paragraph.classList.remove("crisp-recall-card-lines");
+      });
+
       doc.querySelectorAll(".crisp-recall-card-line").forEach((cardLine) => {
         const originalHtml = cardLine.dataset.crispRecallOriginalHtml;
         if (originalHtml !== undefined) {
@@ -1861,45 +1869,9 @@ class CrispRecallPlugin extends Plugin {
     if (this.settings.enableDoubleColon) {
       const paragraphs = element.querySelectorAll("p, li");
       paragraphs.forEach((el) => {
-        const text = el.textContent || "";
-        const alreadyProcessed = el.classList?.contains?.("crisp-recall-card-line");
-        const containsCode = el.querySelector("code, pre");
-        const containsNestedList = el.querySelector("ul, ol");
-        const containsAnnotation = el.querySelector(".crisp-ann")
-          || el.querySelector(".crisp-ann__target")
-          || maskCrispAnnotationDirectives(text) !== text;
-        if (!alreadyProcessed && !containsCode && !containsNestedList && !containsAnnotation) {
-          const card = parseDoubleColonLine(text);
-          if (card) {
-            const { prompt, answer } = card;
-
-            el.dataset.crispRecallOriginalHtml = el.innerHTML;
-            const parts = extractCardLineParts(el, text);
-            if (!parts) el.empty();
-            el.addClass("crisp-recall-card-line");
-
-            const promptSpan = el.createSpan("crisp-recall-card-line__prompt");
-            const dividerSpan = el.createSpan("crisp-recall-card-line__divider");
-            dividerSpan.textContent = "::";
-            const answerSpan = el.createSpan("crisp-recall-cloze crisp-recall-card-line__answer");
-            answerSpan.title = "单击遮罩 / 翻转揭晓";
-
-            if (parts) {
-              promptSpan.append(parts.prompt);
-              answerSpan.append(parts.answer);
-              trimEdgeWhitespace(promptSpan);
-              trimEdgeWhitespace(answerSpan);
-              // The whole line is one card, so highlights inside it are not separate masks.
-              el.querySelectorAll("mark.crisp-recall-cloze").forEach((mark) => {
-                mark.classList.remove("crisp-recall-cloze", "is-revealed");
-                mark.removeAttribute("title");
-              });
-            } else {
-              promptSpan.textContent = prompt;
-              answerSpan.textContent = answer;
-            }
-          }
-        }
+        if (el.classList?.contains?.("crisp-recall-card-lines")) return;
+        if (el.querySelector("br")) this.renderSoftBreakCardLines(el);
+        else this.renderCardLine(el);
       });
     }
 
@@ -1913,6 +1885,80 @@ class CrispRecallPlugin extends Plugin {
         if (floatingHost) this.injectFloatingWidget(floatingHost, context.sourcePath);
       }
     }
+  }
+
+  // Turns one rendered "prompt :: answer" line into a card with a masked answer. Returns false when the
+  // line is not a card or must be left as written.
+  renderCardLine(el) {
+    const text = el.textContent || "";
+    const alreadyProcessed = el.classList?.contains?.("crisp-recall-card-line");
+    const containsCode = el.querySelector("code, pre");
+    const containsNestedList = el.querySelector("ul, ol");
+    const containsAnnotation = el.querySelector(".crisp-ann")
+      || el.querySelector(".crisp-ann__target")
+      || maskCrispAnnotationDirectives(text) !== text;
+    if (alreadyProcessed || containsCode || containsNestedList || containsAnnotation) return false;
+    const card = parseDoubleColonLine(text);
+    if (!card) return false;
+    const { prompt, answer } = card;
+
+    el.dataset.crispRecallOriginalHtml = el.innerHTML;
+    const parts = extractCardLineParts(el, text);
+    if (!parts) el.empty();
+    el.addClass("crisp-recall-card-line");
+
+    const promptSpan = el.createSpan("crisp-recall-card-line__prompt");
+    const dividerSpan = el.createSpan("crisp-recall-card-line__divider");
+    dividerSpan.textContent = "::";
+    const answerSpan = el.createSpan("crisp-recall-cloze crisp-recall-card-line__answer");
+    answerSpan.title = "单击遮罩 / 翻转揭晓";
+
+    if (parts) {
+      promptSpan.append(parts.prompt);
+      answerSpan.append(parts.answer);
+      trimEdgeWhitespace(promptSpan);
+      trimEdgeWhitespace(answerSpan);
+      // The whole line is one card, so highlights inside it are not separate masks.
+      el.querySelectorAll("mark.crisp-recall-cloze").forEach((mark) => {
+        mark.classList.remove("crisp-recall-cloze", "is-revealed");
+        mark.removeAttribute("title");
+      });
+    } else {
+      promptSpan.textContent = prompt;
+      answerSpan.textContent = answer;
+    }
+    return true;
+  }
+
+  // Lines written without a blank line between them render as one paragraph joined by <br>. The review
+  // parser reads them line by line, so each line becomes its own card here too. Lines that are not cards
+  // stay untouched, and so does a paragraph whose <br> sits inside inline formatting. A list bullet or
+  // checkbox goes into the first line's card, where it lines up as it does on a single-line card item.
+  renderSoftBreakCardLines(el) {
+    if (el.querySelector("ul, ol")) return;
+    const nodes = Array.from(el.childNodes);
+    if (nodes.some((node) => node.nodeName !== "BR" && node.querySelector?.("br"))) return;
+
+    const lines = [[]];
+    for (const node of nodes) {
+      if (node.nodeName === "BR") lines.push([]);
+      else lines[lines.length - 1].push(node);
+    }
+
+    const originalHtml = el.innerHTML;
+    let changed = false;
+    for (const line of lines) {
+      const text = line.map((node) => node.textContent).join("");
+      if (!parseDoubleColonLine(text)) continue;
+      const wrapper = el.ownerDocument.createElement("span");
+      el.insertBefore(wrapper, line[0]);
+      wrapper.append(...line);
+      if (this.renderCardLine(wrapper)) changed = true;
+      else wrapper.replaceWith(...wrapper.childNodes);
+    }
+    if (!changed) return;
+    el.dataset.crispRecallOriginalHtml = originalHtml;
+    el.addClass("crisp-recall-card-lines");
   }
 
   async updateActiveLeafFloatingWidget(forceSourcePath = null, { forceAll = false } = {}) {

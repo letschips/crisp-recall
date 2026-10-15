@@ -66,6 +66,11 @@
   transition: background 0.18s ease;
 }
 
+/* A card line split out of a soft-broken paragraph is already a block, so its trailing <br> would add an empty line. */
+.crisp-recall-card-line + br {
+  display: none;
+}
+
 .crisp-recall-card-line:hover {
   background: color-mix(in srgb, var(--crisp-recall-cloze-color, var(--interactive-accent)) 6%, var(--background-secondary));
 }
