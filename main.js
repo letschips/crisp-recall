@@ -299,7 +299,43 @@ function stripCrispAnnotationDirectives(text) {
 }
 
 function stripCardPrefix(text) {
-  return text.replace(/^[-*+]\s+/, "").replace(/^\d+\.\s+/, "").trim();
+  return text
+    .replace(/^(?:>\s*)+/, "")
+    .replace(/^(?:[-*+]|\d+[.)])\s+/, "")
+    .replace(/^\[.\]\s+/, "")
+    .trim();
+}
+
+// Removes Obsidian %%comments%% and HTML <!-- comments -->, which never render. `state.closer` carries an
+// unterminated comment into the following lines. Delimiters inside inline code are not comments.
+function stripMarkdownComments(line, state) {
+  const searchable = maskInlineCode(line);
+  let output = "";
+  let index = 0;
+
+  while (index < line.length) {
+    if (state.closer) {
+      const closeIndex = searchable.indexOf(state.closer, index);
+      if (closeIndex === -1) return output;
+      index = closeIndex + state.closer.length;
+      state.closer = null;
+      continue;
+    }
+
+    const percentIndex = searchable.indexOf("%%", index);
+    const htmlIndex = searchable.indexOf("<!--", index);
+    if (percentIndex === -1 && htmlIndex === -1) {
+      output += line.slice(index);
+      break;
+    }
+    const isPercent = percentIndex !== -1 && (htmlIndex === -1 || percentIndex < htmlIndex);
+    const openIndex = isPercent ? percentIndex : htmlIndex;
+    output += line.slice(index, openIndex);
+    index = openIndex + (isPercent ? 2 : 4);
+    state.closer = isPercent ? "%%" : "-->";
+  }
+
+  return output;
 }
 
 function formatClozeSelection(selection) {
@@ -363,6 +399,61 @@ function parseDoubleColonLine(line) {
   return { prompt, answer, isBiDirectional: separatorInfo.isBiDirectional };
 }
 
+// Splits a rendered "prompt :: answer" paragraph or list item around the separator while keeping its
+// links, emphasis and highlights. List bullets and task checkboxes stay in place. Returns null when the
+// DOM cannot be split, and the caller falls back to plain text.
+function extractCardLineParts(el, text) {
+  const doc = el.ownerDocument;
+  if (!doc?.createRange || !doc.createTreeWalker || !el.lastChild) return null;
+  const separatorInfo = findDoubleColonSeparator(maskCrispAnnotationDirectives(maskInlineCode(text)));
+  if (!separatorInfo) return null;
+
+  const separatorStart = separatorInfo.index;
+  const separatorEnd = separatorStart + separatorInfo.separator.length;
+  let start = null;
+  let end = null;
+  let offset = 0;
+  const walker = doc.createTreeWalker(el, 4 /* NodeFilter.SHOW_TEXT */);
+  for (let node = walker.nextNode(); node && !end; node = walker.nextNode()) {
+    const length = node.nodeValue.length;
+    if (!start && separatorStart < offset + length) start = { node, offset: separatorStart - offset };
+    if (start && separatorEnd <= offset + length) end = { node, offset: separatorEnd - offset };
+    offset += length;
+  }
+  if (!start || !end) return null;
+
+  const isStructural = (node) => node.nodeType === 1
+    && node.matches?.(".list-bullet, .list-collapse-indicator, .task-list-item-checkbox");
+  let firstContent = el.firstChild;
+  while (firstContent && isStructural(firstContent)) firstContent = firstContent.nextSibling;
+  if (!firstContent) return null;
+
+  const answerRange = doc.createRange();
+  answerRange.setStart(end.node, end.offset);
+  answerRange.setEndAfter(el.lastChild);
+  const answer = answerRange.extractContents();
+
+  const separatorRange = doc.createRange();
+  separatorRange.setStart(start.node, start.offset);
+  separatorRange.setEnd(end.node, end.offset);
+  separatorRange.deleteContents();
+
+  const promptRange = doc.createRange();
+  promptRange.setStartBefore(firstContent);
+  promptRange.setEndAfter(el.lastChild);
+  return { prompt: promptRange.extractContents(), answer };
+}
+
+function trimEdgeWhitespace(el) {
+  const walker = el.ownerDocument.createTreeWalker(el, 4 /* NodeFilter.SHOW_TEXT */);
+  const textNodes = [];
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) textNodes.push(node);
+  if (textNodes.length === 0) return;
+  textNodes[0].nodeValue = textNodes[0].nodeValue.trimStart();
+  const last = textNodes[textNodes.length - 1];
+  last.nodeValue = last.nodeValue.trimEnd();
+}
+
 function parseFlashcardsFromText(text, filePath = "", options = {}) {
   const cards = [];
   const lines = text.split("\n");
@@ -370,9 +461,11 @@ function parseFlashcardsFromText(text, filePath = "", options = {}) {
   const enableDoubleColon = options.enableDoubleColon !== false;
   let inFrontmatter = false;
   let fence = null;
+  let inMathBlock = false;
+  const commentState = { closer: null };
 
   for (let i = 0; i < lines.length; i++) {
-    const line = (i === 0 ? lines[i].replace(/^\uFEFF/, "") : lines[i]).trim();
+    let line = (i === 0 ? lines[i].replace(/^\uFEFF/, "") : lines[i]).trim();
 
     if (i === 0 && line === "---") {
       inFrontmatter = true;
@@ -383,14 +476,30 @@ function parseFlashcardsFromText(text, filePath = "", options = {}) {
       continue;
     }
 
+    if (!fence) line = stripMarkdownComments(line, commentState).trim();
+
     const fenceMatch = line.match(/^(`{3,}|~{3,})/);
     if (fenceMatch) {
       const marker = fenceMatch[1];
       if (!fence) fence = { char: marker[0], length: marker.length };
-      else if (marker[0] === fence.char && marker.length >= fence.length) fence = null;
+      // A closing fence carries no info string; "```js" inside a block is still code.
+      else if (
+        marker[0] === fence.char
+        && marker.length >= fence.length
+        && !line.slice(marker.length).trim()
+      ) fence = null;
       continue;
     }
     if (fence) continue;
+
+    if (inMathBlock) {
+      if (line.endsWith("$$")) inMathBlock = false;
+      continue;
+    }
+    if (line.startsWith("$$")) {
+      inMathBlock = line.length < 4 || !line.endsWith("$$");
+      continue;
+    }
     if (!line) continue;
 
     // Structural Markdown is documentation, not card content.
@@ -896,6 +1005,20 @@ class CrispRecallPlugin extends Plugin {
     this.registerDomEvent(doc, "keydown", (event) => {
       if (event.key === "Escape") this.hideSelectionBubble(doc);
     });
+
+    // One delegated listener per window for every Reading View mask. Capture phase runs before Obsidian's
+    // link handler, so a link inside a masked answer reveals it instead of navigating away.
+    this.registerDomEvent(doc, "click", (event) => this.handleClozeClick(event), true);
+  }
+
+  handleClozeClick(event) {
+    if (this.unloaded) return;
+    const cloze = event.target?.closest?.(".crisp-recall-cloze");
+    if (!cloze) return;
+    if (cloze.classList.contains("is-revealed") && event.target.closest("a")) return;
+    event.preventDefault();
+    event.stopPropagation();
+    cloze.classList.toggle("is-revealed");
   }
 
   detachSelectionDocument(doc) {
@@ -1240,6 +1363,8 @@ class CrispRecallPlugin extends Plugin {
       leaf.view?.previewMode?.rerender?.(true);
     });
     this.app.workspace?.updateOptions?.();
+    // Card settings change the count even when the note itself did not change.
+    return this.updateActiveLeafFloatingWidget(null, { forceAll: true });
   }
 
   processMarkdownView(element, context) {
@@ -1259,11 +1384,6 @@ class CrispRecallPlugin extends Plugin {
 
         mark.classList.add("crisp-recall-cloze");
         mark.title = "单击遮罩 / 翻转揭晓";
-        this.registerDomEvent(mark, "click", (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          mark.classList.toggle("is-revealed");
-        });
       });
     }
 
@@ -1284,23 +1404,30 @@ class CrispRecallPlugin extends Plugin {
             const { prompt, answer } = card;
 
             el.dataset.crispRecallOriginalHtml = el.innerHTML;
-            el.empty();
+            const parts = extractCardLineParts(el, text);
+            if (!parts) el.empty();
             el.addClass("crisp-recall-card-line");
 
             const promptSpan = el.createSpan("crisp-recall-card-line__prompt");
-            promptSpan.textContent = prompt;
-
             const dividerSpan = el.createSpan("crisp-recall-card-line__divider");
             dividerSpan.textContent = "::";
-
             const answerSpan = el.createSpan("crisp-recall-cloze crisp-recall-card-line__answer");
-            answerSpan.textContent = answer;
             answerSpan.title = "单击遮罩 / 翻转揭晓";
-            answerSpan.onclick = (e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              answerSpan.classList.toggle("is-revealed");
-            };
+
+            if (parts) {
+              promptSpan.append(parts.prompt);
+              answerSpan.append(parts.answer);
+              trimEdgeWhitespace(promptSpan);
+              trimEdgeWhitespace(answerSpan);
+              // The whole line is one card, so highlights inside it are not separate masks.
+              el.querySelectorAll("mark.crisp-recall-cloze").forEach((mark) => {
+                mark.classList.remove("crisp-recall-cloze", "is-revealed");
+                mark.removeAttribute("title");
+              });
+            } else {
+              promptSpan.textContent = prompt;
+              answerSpan.textContent = answer;
+            }
           }
         }
       });
@@ -1318,7 +1445,7 @@ class CrispRecallPlugin extends Plugin {
     }
   }
 
-  async updateActiveLeafFloatingWidget(forceSourcePath = null) {
+  async updateActiveLeafFloatingWidget(forceSourcePath = null, { forceAll = false } = {}) {
     if (this.unloaded || !this.settings.enableFloatingPill || !this.isLicenseValid()) {
       for (const doc of this.getPluginDocuments()) {
         doc.querySelectorAll(".crisp-recall-floating-pill").forEach((pill) => pill.remove());
@@ -1342,7 +1469,7 @@ class CrispRecallPlugin extends Plugin {
       try {
         const sourcePath = view.file.path;
         await this.injectFloatingWidget(container, sourcePath, {
-          force: sourcePath === forceSourcePath,
+          force: forceAll || sourcePath === forceSourcePath,
         });
       } catch (err) {
         console.debug("Crisp Recall floating widget update error:", err);
@@ -1412,9 +1539,13 @@ class CrispRecallPlugin extends Plugin {
 
   toggleAllMasks() {
     if (!this.ensureLicenseActivated()) return;
-    const activeContainer = this.app.workspace.activeLeaf?.view?.containerEl;
-    const clozes = activeContainer?.querySelectorAll(".crisp-recall-cloze") || [];
-    if (clozes.length === 0) {
+    const activeView = this.app.workspace.activeLeaf?.view;
+    // Long notes only mount the sections near the viewport; the renderer keeps every section's element.
+    const roots = [activeView?.containerEl];
+    activeView?.previewMode?.renderer?.sections?.forEach((section) => roots.push(section?.el));
+    const clozes = new Set();
+    roots.forEach((root) => root?.querySelectorAll?.(".crisp-recall-cloze").forEach((c) => clozes.add(c)));
+    if (clozes.size === 0) {
       new Notice("当前页面没有发现自测挖空或闪卡。");
       return;
     }
@@ -1686,7 +1817,7 @@ class CrispRecallSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("启用划词制卡悬浮气泡 (Selection Floating Toolbar)")
-      .setDesc("在编辑模式选中文本时，自动在选区上方浮现 Apple 风格磨砂制卡微胶囊。")
+      .setDesc("在编辑模式选中文本时，自动在选区上方浮现制卡微胶囊。")
       .addToggle((t) =>
         t.setValue(this.plugin.settings.enableSelectionBubble).onChange(async (v) => {
           this.plugin.settings.enableSelectionBubble = v;

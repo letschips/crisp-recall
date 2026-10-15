@@ -82,6 +82,7 @@ function makeClassList() {
     add: (...names) => names.forEach((name) => values.add(name)),
     remove: (...names) => names.forEach((name) => values.delete(name)),
     contains: (name) => values.has(name),
+    toggle: (name) => (values.has(name) ? !values.delete(name) : !!values.add(name)),
   };
 }
 
@@ -322,6 +323,50 @@ Remember ==this== today.`);
   assert.deepEqual(
     JSON.parse(JSON.stringify(cards.map(({ type, answer }) => [type, answer]))),
     [["concept", "Real answer"], ["cloze", "this"]]
+  );
+});
+
+test("card prompts drop blockquote, task checkbox, and ordered list markers", () => {
+  const { parseFlashcardsFromText } = loadPlugin();
+  const cards = parseFlashcardsFromText([
+    "> Quoted question :: Quoted answer",
+    "> > Nested quote :: Nested answer",
+    "- [ ] Task question :: Task answer",
+    "> - [x] Quoted ==done== task",
+    "1) Paren question :: Paren answer",
+  ].join("\n"));
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(cards.map(({ prompt }) => prompt))),
+    ["Quoted question", "Nested quote", "Task question", "Quoted  [ ❓ …… ]  task", "Paren question"],
+  );
+});
+
+test("parser ignores comments, math blocks, and fences closed by an info string", () => {
+  const { parseFlashcardsFromText } = loadPlugin();
+  const cards = parseFlashcardsFromText([
+    "%% Hidden :: Not a card %%",
+    "%%",
+    "Block comment :: Not a card",
+    "%%",
+    "<!-- Html :: Not a card -->",
+    "<!--",
+    "Html block ==not a card==",
+    "-->",
+    "$$",
+    "a::b",
+    "$$",
+    "```js",
+    "code",
+    "```js",
+    "Still code :: Not a card",
+    "```",
+    "Visible %%note%% question :: Real answer",
+  ].join("\n"));
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(cards.map(({ prompt, answer }) => [prompt, answer]))),
+    [["Visible  question", "Real answer"]],
   );
 });
 
@@ -603,6 +648,134 @@ test("toggle all masks only affects the active Markdown pane", () => {
 
   assert.equal(activeMask.classList.contains("is-revealed"), true);
   assert.equal(otherMask.classList.contains("is-revealed"), false);
+});
+
+test("toggle all masks also reaches sections Obsidian has not mounted yet", () => {
+  const mountedMask = { classList: makeClassList() };
+  const unmountedMask = { classList: makeClassList() };
+  const { PluginClass } = loadPlugin();
+  const plugin = new PluginClass({
+    workspace: {
+      activeLeaf: {
+        view: {
+          containerEl: { querySelectorAll: () => [mountedMask] },
+          previewMode: {
+            renderer: {
+              sections: [
+                { el: { querySelectorAll: () => [mountedMask] } },
+                { el: { querySelectorAll: () => [unmountedMask] } },
+              ],
+            },
+          },
+        },
+      },
+    },
+  });
+  plugin.licenseState = { valid: true, payload: { product: "Crisp Suite" } };
+
+  plugin.toggleAllMasks();
+  assert.equal(mountedMask.classList.contains("is-revealed"), true);
+  assert.equal(unmountedMask.classList.contains("is-revealed"), true);
+
+  plugin.toggleAllMasks();
+  assert.equal(unmountedMask.classList.contains("is-revealed"), false);
+});
+
+function makeClickNode(parent, { classes = [], tagName = "span" } = {}) {
+  const classList = makeClassList();
+  classes.forEach((name) => classList.add(name));
+  const node = {
+    parentElement: parent,
+    tagName,
+    classList,
+    closest(selector) {
+      for (let current = node; current; current = current.parentElement) {
+        if (selector === "a" && current.tagName === "a") return current;
+        if (selector.startsWith(".") && current.classList.contains(selector.slice(1))) return current;
+      }
+      return null;
+    },
+  };
+  return node;
+}
+
+function makeClickEvent(target) {
+  return {
+    target,
+    defaultPrevented: false,
+    propagationStopped: false,
+    preventDefault() { this.defaultPrevented = true; },
+    stopPropagation() { this.propagationStopped = true; },
+  };
+}
+
+test("reading view masks share one click listener instead of one per highlight", () => {
+  const { PluginClass } = loadPlugin();
+  const marks = [1, 2, 3].map(() => ({ classList: makeClassList(), closest: () => null }));
+  const root = {
+    querySelectorAll: (selector) => (selector === "mark" ? marks : []),
+    closest: () => null,
+  };
+  const plugin = new PluginClass();
+  let registeredListeners = 0;
+  plugin.registerDomEvent = () => { registeredListeners += 1; };
+  plugin.settings = { enableCloze: true, enableDoubleColon: false, enableFloatingPill: false };
+  plugin.licenseState = { valid: true, payload: { product: "Crisp Suite" } };
+
+  plugin.processMarkdownView(root, {});
+  plugin.processMarkdownView(root, {});
+
+  assert.equal(registeredListeners, 0);
+  assert.ok(marks.every((mark) => mark.classList.contains("crisp-recall-cloze")));
+});
+
+test("clicking a mask toggles it, and links work once the answer is revealed", () => {
+  const { PluginClass } = loadPlugin();
+  const plugin = new PluginClass();
+  const answer = makeClickNode(null, { classes: ["crisp-recall-cloze"] });
+  const link = makeClickNode(answer, { tagName: "a" });
+
+  const maskedClick = makeClickEvent(link);
+  plugin.handleClozeClick(maskedClick);
+  assert.equal(answer.classList.contains("is-revealed"), true);
+  assert.equal(maskedClick.defaultPrevented, true);
+
+  const revealedLinkClick = makeClickEvent(link);
+  plugin.handleClozeClick(revealedLinkClick);
+  assert.equal(answer.classList.contains("is-revealed"), true);
+  assert.equal(revealedLinkClick.defaultPrevented, false);
+
+  plugin.handleClozeClick(makeClickEvent(answer));
+  assert.equal(answer.classList.contains("is-revealed"), false);
+
+  const outside = makeClickEvent(makeClickNode(null));
+  plugin.handleClozeClick(outside);
+  assert.equal(outside.defaultPrevented, false);
+});
+
+test("changing card settings refreshes the floating controller count", async () => {
+  const { PluginClass } = loadPlugin();
+  const file = { path: "note.md", basename: "note" };
+  const container = new FakeElement("workspace-leaf-content");
+  const view = { file, containerEl: container, getMode: () => "preview" };
+  const plugin = new PluginClass({
+    workspace: { getLeavesOfType: () => [{ view }], iterateAllLeaves() {} },
+    vault: {
+      getFileByPath: () => file,
+      async cachedRead() {
+        return "Question :: Answer\nRemember ==this==";
+      },
+    },
+  });
+  plugin.settings = { enableCloze: true, enableDoubleColon: true, enableFloatingPill: true };
+  plugin.licenseState = { valid: true, payload: { product: "Crisp Suite" } };
+
+  await plugin.updateActiveLeafFloatingWidget();
+  assert.equal(container.querySelector(".crisp-recall-pill-count").textContent, "2");
+
+  plugin.settings.enableCloze = false;
+  await plugin.refreshReadingViews();
+  assert.equal(container.querySelector(".crisp-recall-pill-count").textContent, "1");
 });
 
 test("concurrent post-processors inject only one floating controller", async () => {

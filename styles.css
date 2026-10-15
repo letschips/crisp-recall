@@ -34,6 +34,14 @@
   text-shadow: 0 0 3px color-mix(in srgb, var(--crisp-recall-cloze-color, var(--interactive-accent)) 95%, var(--text-normal)) !important;
 }
 
+/* Links, highlights and emphasis inside a masked answer carry their own colours; hide them as well. */
+.crisp-recall-cloze:not(.is-revealed) * {
+  color: transparent !important;
+  background-color: transparent !important;
+  text-decoration-color: transparent !important;
+  text-shadow: inherit !important;
+}
+
 .crisp-recall-cloze.is-revealed {
   color: var(--text-normal) !important;
   text-shadow: none !important;
