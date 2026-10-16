@@ -5,7 +5,7 @@ const test = require("node:test");
 const vm = require("node:vm");
 const { webcrypto } = require("node:crypto");
 
-function loadPlugin({ document } = {}) {
+function loadPlugin({ document, renderMath, finishRenderMath } = {}) {
   const notices = [];
   class Plugin {
     constructor(app) {
@@ -48,6 +48,8 @@ function loadPlugin({ document } = {}) {
         Setting,
         PluginSettingTab,
         Notice,
+        renderMath,
+        finishRenderMath,
         requestUrl: async () => {
           throw new Error("Unexpected live request in test");
         },
@@ -1604,4 +1606,148 @@ test("a single-line card paragraph keeps its links and formatting", () => {
   assert.equal(root.querySelector("p").classList.contains("crisp-recall-card-line"), true);
   assert.ok(root.querySelector(".crisp-recall-card-line__answer em"));
   assert.ok(root.querySelector(".crisp-recall-card-line__answer a.internal-link"));
+});
+
+const cardPairs = (cards) => JSON.parse(JSON.stringify(cards.map(({ prompt, answer }) => [prompt, answer])));
+
+test("inline formulas can be clozed and their = or :: never split a card", () => {
+  const { parseFlashcardsFromText } = loadPlugin();
+  const cards = parseFlashcardsFromText([
+    "公式 ==$e^{i\\pi}+1=0$== 是什么",
+    "若 $a==b$ 且 $c==d$ 则相等",
+    "$a::b$ 只是公式",
+    "能量 $E==mc^2==$",
+    "质能 :: $E=mc^2$",
+  ].join("\n"));
+
+  assert.deepEqual(cardPairs(cards), [
+    ["公式  [ ❓ …… ]  是什么", "$e^{i\\pi}+1=0$"],
+    ["能量 $E\\boxed{\\,?\\,}$", "$mc^2$"],
+    ["质能", "$E=mc^2$"],
+  ]);
+});
+
+test("math blocks hold clozes and can answer the question line right above them", () => {
+  const { parseFlashcardsFromText } = loadPlugin();
+  const cards = parseFlashcardsFromText([
+    "$$",
+    "==e^{i\\pi}==+1=0",
+    "$$",
+    "",
+    "欧拉恒等式 ::",
+    "$$",
+    "e^{i\\pi}+1=0",
+    "$$",
+    "",
+    "- 平方 :::",
+    "  $$x^2$$",
+    "",
+    "问 ::",
+    "$$==a==+b$$",
+    "",
+    "无关 ::",
+    "",
+    "$$a::b$$",
+  ].join("\n"));
+
+  assert.deepEqual(cardPairs(cards), [
+    ["$$\\boxed{\\,?\\,}+1=0$$", "$$e^{i\\pi}$$"],
+    ["欧拉恒等式", "$$e^{i\\pi}+1=0$$"],
+    ["平方", "$$x^2$$"],
+    ["$$x^2$$", "平方"],
+    ["问", "$$a+b$$"],
+  ]);
+});
+
+test("Cloze selection inside a math block leaves the $$ fences unwrapped", () => {
+  const { PluginClass } = loadPlugin();
+  let replacement = null;
+  const editor = {
+    getSelection: () => "$$\ne^{i\\pi}+1=0\n$$",
+    replaceSelection(value) { replacement = value; },
+    focus() {},
+  };
+  const plugin = new PluginClass();
+  plugin.licenseState = { valid: true, payload: { product: "Crisp Suite" } };
+
+  plugin.handleSelectionAction("cloze", editor);
+
+  assert.equal(replacement, "$$\n==e^{i\\pi}+1=0==\n$$");
+});
+
+test("review cards render their formulas and keep the surrounding text", () => {
+  const calls = [];
+  let finished = 0;
+  const { ReviewModal } = loadPlugin({
+    renderMath: (source, display) => {
+      calls.push([source, display]);
+      return Object.assign(new FakeElement("math"), { math: source });
+    },
+    finishRenderMath: async () => { finished += 1; },
+  });
+  const modal = new ReviewModal({}, [{ typeName: "挖空填空卡", prompt: "能量 $E\\boxed{?}$ 守恒", answer: "$$mc^2$$" }]);
+  modal.contentEl = new FakeElement();
+
+  modal.renderCard();
+
+  assert.deepEqual(calls, [["E\\boxed{?}", false], ["mc^2", true]]);
+  assert.ok(finished > 0);
+  const [front] = modal.contentEl.querySelectorAll(".crisp-recall-card__content");
+  const parts = front.children[0].children.map((child) => child.math ?? child.textContent);
+  assert.deepEqual(parts, ["能量 ", "E\\boxed{?}", " 守恒"]);
+});
+
+function mathHtml(latex, tag = "div", cls = "math math-block") {
+  return `<${tag} class="${cls} is-loaded"><mjx-container class="MathJax"><mjx-math data-latex="${latex}">rendered</mjx-math></mjx-container></${tag}>`;
+}
+
+function mathReadingSetup(bodyHtml) {
+  const { dom, root } = makeReadingDom(bodyHtml);
+  const calls = [];
+  const renderMath = (source, display) => {
+    calls.push([source, display]);
+    const container = dom.window.document.createElement("mjx-container");
+    container.innerHTML = source.replace(/\\class\{(mjx-[\w-]+)\}\{([^}]*)\}/g, "<mjx-mrow class=\"$1\">$2</mjx-mrow>");
+    return container;
+  };
+  const { PluginClass } = loadPlugin({ document: dom.window.document, renderMath, finishRenderMath: async () => {} });
+  return { dom, root, calls, plugin: readingPlugin(PluginClass) };
+}
+
+test("reading view masks clozes written inside a formula and restores it on unload", () => {
+  const { root, calls, plugin } = mathReadingSetup(mathHtml("==e^{i\\pi}==+1=0"));
+  const original = root.innerHTML;
+
+  plugin.processMarkdownView(root, {});
+  plugin.processMarkdownView(root, {});
+
+  assert.deepEqual(calls, [["\\class{mjx-crisp-recall-cloze}{e^{i\\pi}}+1=0", true]]);
+  const mask = root.querySelector(".mjx-crisp-recall-cloze");
+  assert.ok(mask.classList.contains("crisp-recall-cloze"));
+
+  plugin.onunload();
+  assert.equal(root.innerHTML.replace(/ class=""/g, ""), original);
+});
+
+test("reading view masks a math block that answers the question line above it", () => {
+  const sectionInfo = (text, lineStart) => ({ getSectionInfo: () => ({ text, lineStart, lineEnd: lineStart + 2 }) });
+
+  const answered = mathReadingSetup(mathHtml("==e==+1"));
+  answered.plugin.processMarkdownView(answered.root, sectionInfo("欧拉恒等式 ::\n$$\n==e==+1\n$$", 1));
+  const block = answered.root.querySelector(".math-block");
+  assert.ok(block.classList.contains("crisp-recall-cloze"));
+  // The whole formula is the answer, so markers inside it render as plain formula text.
+  assert.deepEqual(answered.calls, [["e+1", true]]);
+  assert.equal(answered.root.querySelector(".mjx-crisp-recall-cloze"), null);
+
+  const plain = mathReadingSetup(mathHtml("x^2"));
+  plain.plugin.processMarkdownView(plain.root, sectionInfo("Just text\n$$\nx^2\n$$", 1));
+  assert.equal(plain.root.querySelector(".crisp-recall-cloze"), null);
+
+  const soft = mathReadingSetup(
+    `<ul><li><span class="list-bullet"></span>平方 :::<br>\n${mathHtml("x^2", "span")}</li></ul>`,
+  );
+  soft.plugin.processMarkdownView(soft.root, {});
+  assert.ok(soft.root.querySelector(".math-block").classList.contains("crisp-recall-cloze"));
+  assert.equal(soft.root.querySelector(".crisp-recall-card-line"), null);
 });

@@ -7,6 +7,7 @@ Crisp Recall turns ordinary Obsidian Markdown into lightweight active-recall pro
 - Cloze prompts from Markdown highlights such as `==answer==`.
 - Question-and-answer cards using `Question :: Answer`.
 - Bidirectional cards using `Front ::: Back`.
+- Formulas: cloze a whole formula or part of one, and use a formula or a `$$` math block as an answer.
 - Click-to-reveal answers directly in reading mode.
 - Focused review sessions for the active note or a random vault-wide set.
 - Spaced repetition with FSRS-5: every rating schedules the card's next review, and **Review cards due today** brings back what is due.
@@ -30,6 +31,12 @@ Question :: Answer
 Front ::: Back
 Remember ==this part==.
 The capital is {c1::Paris}.
+Euler's identity is ==$e^{i\pi}+1=0$==.
+Mass–energy: $E==mc^2==$
+Euler's identity ::
+$$
+e^{i\pi}+1=0
+$$
 ```
 
 ---
@@ -43,6 +50,7 @@ Crisp Recall 把普通 Markdown 直接变成低摩擦的主动回忆与闪卡练
 - 将 `==答案==` 渲染成可点击揭晓的挖空提示。
 - 使用 `问题 :: 答案` 创建问答卡。
 - 使用 `正面 ::: 背面` 创建双向卡片。
+- 公式：可以挖空整个公式或其中一部分（在公式里写 `==…==`），也可以用公式或 `$$` 公式块作答案（写在 `问题 ::` 的下一行）。
 - 在阅读模式直接遮罩或揭晓答案。
 - 对当前笔记进行集中练习，或从整个仓库随机抽取闪卡。
 - 基于 FSRS-5 的间隔重复：每次评分都会排好下次复习，用「今日到期复习」命令复习到期卡片。

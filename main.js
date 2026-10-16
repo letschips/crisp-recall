@@ -3,7 +3,9 @@
    Crafted by letschips (Xiaohongshu)
    ========================================================================== */
 
-const { Plugin, Modal, Setting, PluginSettingTab, Notice, requestUrl } = require("obsidian");
+const {
+  Plugin, Modal, Setting, PluginSettingTab, Notice, requestUrl, renderMath, finishRenderMath,
+} = require("obsidian");
 
 // Obsidian's Plugin.loadData() returns null for a missing data.json but undefined when the file exists
 // and cannot be read or parsed (sync conflict, interrupted write), and Plugin.saveData() swallows write
@@ -293,6 +295,73 @@ function maskInlineCode(text) {
   return masked.join("");
 }
 
+// Obsidian math: $$...$$ (may span lines) or $...$ on one line with no space just inside either dollar.
+// A backslash escapes a dollar. Each range covers the delimiters; content sits between them.
+function findMathRanges(text) {
+  const ranges = [];
+  const isDollar = (i) => text[i] === "$" && text[i - 1] !== "\\";
+  let index = 0;
+
+  while (index < text.length) {
+    if (!isDollar(index)) {
+      index++;
+      continue;
+    }
+    if (isDollar(index + 1)) {
+      const close = text.indexOf("$$", index + 2);
+      if (close <= index + 2) {
+        index += 2;
+        continue;
+      }
+      ranges.push({ start: index, end: close + 2, contentStart: index + 2, contentEnd: close, display: true });
+      index = close + 2;
+      continue;
+    }
+    let close = -1;
+    if (text[index + 1] && !/\s/.test(text[index + 1])) {
+      for (let j = index + 1; j < text.length && text[j] !== "\n"; j++) {
+        if (isDollar(j) && !/\s/.test(text[j - 1])) {
+          close = j;
+          break;
+        }
+      }
+    }
+    if (close === -1) {
+      index++;
+      continue;
+    }
+    ranges.push({ start: index, end: close + 1, contentStart: index + 1, contentEnd: close, display: false });
+    index = close + 1;
+  }
+
+  return ranges;
+}
+
+// Formula content is never card syntax: "=" and "::" inside it belong to the formula.
+function maskMath(text) {
+  const masked = text.split("");
+  for (const range of findMathRanges(text)) masked.fill(" ", range.contentStart, range.contentEnd);
+  return masked.join("");
+}
+
+// ==target== written inside a formula marks a cloze; the target itself may contain "=".
+const MATH_CLOZE_PATTERN = /==((?:(?!==)[\s\S])+?)==/g;
+const MATH_CLOZE_BLANK = "\\boxed{\\,?\\,}";
+
+function findMathClozes(latex) {
+  return Array.from(latex.matchAll(MATH_CLOZE_PATTERN)).filter((match) => match[1].trim());
+}
+
+// Rewrites each cloze in a formula: replacer(target, clozeIndex) returns its LaTeX.
+function replaceMathClozes(latex, replacer) {
+  let clozeIndex = 0;
+  return latex.replace(MATH_CLOZE_PATTERN, (match, target) => (
+    target.trim() ? replacer(target, clozeIndex++) : match
+  ));
+}
+
+const unwrapMathClozes = (latex) => replaceMathClozes(latex, (target) => target);
+
 function maskCrispAnnotationDirectives(text) {
   return text.replace(
     /\{ann\s+(?:"(?:\\.|[^"\\])*"|[^}])*\}/gi,
@@ -358,7 +427,7 @@ function formatClozeSelection(selection) {
         prefix,
         body,
         suffix,
-        eligible: body.length > 0,
+        eligible: body.length > 0 && body !== "$$",
         wrapped: body.startsWith("==") && body.endsWith("==") && body.length >= 4,
       };
     });
@@ -392,17 +461,25 @@ function findDoubleColonSeparator(searchableLine) {
   };
 }
 
-function parseDoubleColonLine(line) {
-  const separatorInfo = findDoubleColonSeparator(maskCrispAnnotationDirectives(maskInlineCode(line)));
+function parseDoubleColonLine(line, { allowEmptyAnswer = false } = {}) {
+  const separatorInfo = findDoubleColonSeparator(maskMath(maskCrispAnnotationDirectives(maskInlineCode(line))));
   if (!separatorInfo) return null;
 
   const prompt = stripCardPrefix(stripCrispAnnotationDirectives(line.slice(0, separatorInfo.index)));
   const answer = stripCrispAnnotationDirectives(
     line.slice(separatorInfo.index + separatorInfo.separator.length),
   );
-  if (!prompt || !answer || /^https?:\/\//i.test(prompt)) return null;
+  if (!prompt || (!answer && !allowEmptyAnswer) || /^https?:\/\//i.test(prompt)) return null;
 
   return { prompt, answer, isBiDirectional: separatorInfo.isBiDirectional };
+}
+
+// "Question ::" with nothing after the separator: the math block on the next line is its answer.
+function parseMathQuestionLine(line) {
+  const text = (line || "").trim();
+  if (text.startsWith("|") || /^#{1,6}\s/.test(text)) return null;
+  const card = parseDoubleColonLine(text, { allowEmptyAnswer: true });
+  return card && !card.answer ? card : null;
 }
 
 // Splits a rendered "prompt :: answer" paragraph or list item around the separator while keeping its
@@ -467,8 +544,59 @@ function parseFlashcardsFromText(text, filePath = "", options = {}) {
   const enableDoubleColon = options.enableDoubleColon !== false;
   let inFrontmatter = false;
   let fence = null;
-  let inMathBlock = false;
+  let mathBlock = null;
+  let mathQuestion = null;
   const commentState = { closer: null };
+
+  const pushConceptCards = (card, line) => {
+    cards.push({
+      id: `${filePath}:${line}:concept`,
+      type: "concept",
+      typeName: card.isBiDirectional ? "双向概念卡" : "问答 / 概念卡",
+      prompt: card.prompt,
+      answer: card.answer,
+      line,
+      filePath: filePath,
+    });
+    if (card.isBiDirectional) {
+      cards.push({
+        id: `${filePath}:${line}:concept:reverse`,
+        type: "concept",
+        isReverse: true,
+        typeName: "双向概念卡",
+        prompt: card.answer,
+        answer: card.prompt,
+        line,
+        filePath: filePath,
+      });
+    }
+  };
+
+  // A math block answers the "Question ::" line right above it; otherwise each ==target== inside it is a
+  // cloze that hides that part of the formula.
+  const emitMathBlock = (block) => {
+    const latex = block.lines.join("\n").trim();
+    const question = mathQuestion?.line === block.line - 1 ? mathQuestion : null;
+    mathQuestion = null;
+    if (!latex) return;
+    if (question) {
+      pushConceptCards({ ...question, answer: `$$${unwrapMathClozes(latex)}$$` }, question.line);
+      return;
+    }
+    if (!enableCloze) return;
+    findMathClozes(latex).forEach((match, clozeIndex) => {
+      const blanked = replaceMathClozes(latex, (target, k) => (k === clozeIndex ? MATH_CLOZE_BLANK : target));
+      cards.push({
+        id: `${filePath}:${block.line}:cloze:${clozeIndex + 1}`,
+        type: "cloze",
+        typeName: "挖空填空卡",
+        prompt: `$$${blanked}$$`,
+        answer: `$$${match[1].trim()}$$`,
+        line: block.line,
+        filePath: filePath,
+      });
+    });
+  };
 
   for (let i = 0; i < lines.length; i++) {
     let line = (i === 0 ? lines[i].replace(/^\uFEFF/, "") : lines[i]).trim();
@@ -498,12 +626,23 @@ function parseFlashcardsFromText(text, filePath = "", options = {}) {
     }
     if (fence) continue;
 
-    if (inMathBlock) {
-      if (line.endsWith("$$")) inMathBlock = false;
+    if (mathBlock) {
+      const closes = line.endsWith("$$");
+      mathBlock.lines.push(closes ? line.slice(0, -2) : line);
+      if (closes) {
+        emitMathBlock(mathBlock);
+        mathBlock = null;
+      }
       continue;
     }
     if (line.startsWith("$$")) {
-      inMathBlock = line.length < 4 || !line.endsWith("$$");
+      const rest = line.slice(2);
+      const closes = rest.length >= 2 && rest.endsWith("$$");
+      mathBlock = { line: i, lines: [closes ? rest.slice(0, -2) : rest] };
+      if (closes) {
+        emitMathBlock(mathBlock);
+        mathBlock = null;
+      }
       continue;
     }
     if (!line) continue;
@@ -511,32 +650,20 @@ function parseFlashcardsFromText(text, filePath = "", options = {}) {
     // Structural Markdown is documentation, not card content.
     if (line.startsWith("|") || /^#{1,6}\s/.test(line)) continue;
 
-    const searchableLine = maskCrispAnnotationDirectives(maskInlineCode(line));
+    const codeMaskedLine = maskCrispAnnotationDirectives(maskInlineCode(line));
+    const searchableLine = maskMath(codeMaskedLine);
 
     // 1. Double colon cards: "Prompt :: Answer" or "Prompt ::: Answer"
+    if (enableDoubleColon && (lines[i + 1] || "").trim().startsWith("$$")) {
+      const question = parseMathQuestionLine(line);
+      if (question) {
+        mathQuestion = { ...question, line: i };
+        continue;
+      }
+    }
     const doubleColonCard = enableDoubleColon ? parseDoubleColonLine(line) : null;
     if (doubleColonCard) {
-      cards.push({
-        id: `${filePath}:${i}:concept`,
-        type: "concept",
-        typeName: doubleColonCard.isBiDirectional ? "双向概念卡" : "问答 / 概念卡",
-        prompt: doubleColonCard.prompt,
-        answer: doubleColonCard.answer,
-        line: i,
-        filePath: filePath,
-      });
-      if (doubleColonCard.isBiDirectional) {
-        cards.push({
-          id: `${filePath}:${i}:concept:reverse`,
-          type: "concept",
-          isReverse: true,
-          typeName: "双向概念卡",
-          prompt: doubleColonCard.answer,
-          answer: doubleColonCard.prompt,
-          line: i,
-          filePath: filePath,
-        });
-      }
+      pushConceptCards(doubleColonCard, i);
       continue;
     }
 
@@ -559,29 +686,49 @@ function parseFlashcardsFromText(text, filePath = "", options = {}) {
       continue;
     }
 
-    // 3. Cloze Deletions: ==target==, {{c1::target::hint}}, or legacy {c1::target}
+    // 3. Cloze Deletions: ==target==, {{c1::target::hint}}, or legacy {c1::target}; inside a $formula$,
+    // ==target== hides that part of the formula.
     if (!enableCloze) continue;
+    const clozes = [];
     const clozeRegex = /==([^=]+)==|\{\{c\d+::((?:(?!::)[^}])+)(?:::[^}]*)?\}\}|\{c\d+::((?:(?!::)[^}])+)(?:::[^}]*)?\}/g;
     let match;
-    let clozeIdx = 0;
     while ((match = clozeRegex.exec(searchableLine)) !== null) {
-      const target = (match[1] || match[2] || match[3] || "").trim();
+      const group = match[1] ?? match[2] ?? match[3] ?? "";
+      const groupStart = match.index + (match[1] !== undefined ? 2 : match[0].indexOf("::") + 2);
+      // Read the target from the line itself: the searchable copy blanks out formulas.
+      const target = line.slice(groupStart, groupStart + group.length).trim();
       if (!target) continue;
-      clozeIdx++;
       // Prompt is the sentence with [ ... ] replacing the target
-      const maskedSentence = stripCrispAnnotationDirectives(
-        `${line.slice(0, match.index)} [ ❓ …… ] ${line.slice(match.index + match[0].length)}`,
-      );
+      clozes.push({
+        index: match.index,
+        prompt: `${line.slice(0, match.index)} [ ❓ …… ] ${line.slice(match.index + match[0].length)}`,
+        answer: target,
+      });
+    }
+    for (const range of findMathRanges(codeMaskedLine)) {
+      const latex = line.slice(range.contentStart, range.contentEnd);
+      const delimiter = range.display ? "$$" : "$";
+      findMathClozes(latex).forEach((mathMatch, clozeIndex) => {
+        const blanked = replaceMathClozes(latex, (target, k) => (k === clozeIndex ? MATH_CLOZE_BLANK : target));
+        clozes.push({
+          index: range.contentStart + mathMatch.index,
+          prompt: `${line.slice(0, range.contentStart)}${blanked}${line.slice(range.contentEnd)}`,
+          answer: `${delimiter}${mathMatch[1].trim()}${delimiter}`,
+        });
+      });
+    }
+    clozes.sort((a, b) => a.index - b.index);
+    clozes.forEach((cloze, clozeIndex) => {
       cards.push({
-        id: `${filePath}:${i}:cloze:${clozeIdx}`,
+        id: `${filePath}:${i}:cloze:${clozeIndex + 1}`,
         type: "cloze",
         typeName: "挖空填空卡",
-        prompt: stripCardPrefix(maskedSentence),
-        answer: target,
+        prompt: stripCardPrefix(stripCrispAnnotationDirectives(cloze.prompt)),
+        answer: cloze.answer,
         line: i,
         filePath: filePath,
       });
-    }
+    });
   }
 
   assignCardKeys(cards);
@@ -975,6 +1122,32 @@ function buildDueReviewQueue(cards, store, today, { newLimit = 20, random = Math
 // --------------------------------------------------------------------------
 // 2. 3D Zen Flashcard Review Modal
 // --------------------------------------------------------------------------
+// Card text with its $formulas$ typeset. A formula that cannot be typeset stays as written.
+function renderRecallCardContent(container, text) {
+  const flow = container.createSpan();
+  let index = 0;
+  let typeset = false;
+  if (typeof renderMath === "function") {
+    for (const range of findMathRanges(maskInlineCode(text))) {
+      let mathEl = null;
+      try {
+        mathEl = renderMath(text.slice(range.contentStart, range.contentEnd).trim(), range.display);
+      } catch (error) {
+        console.debug("Crisp Recall could not typeset a formula:", error);
+      }
+      if (!mathEl) continue;
+      if (range.start > index) flow.createSpan({ text: text.slice(index, range.start) });
+      flow.append(mathEl);
+      index = range.end;
+      typeset = true;
+    }
+  }
+  if (index < text.length) flow.createSpan({ text: text.slice(index) });
+  if (typeset && typeof finishRenderMath === "function") {
+    Promise.resolve(finishRenderMath()).catch(() => {});
+  }
+}
+
 class CrispRecallReviewModal extends Modal {
   constructor(app, cards, title = "Crisp Recall 抽认练习", { onRate = null, getIntervals = null } = {}) {
     super(app);
@@ -1114,14 +1287,14 @@ class CrispRecallReviewModal extends Modal {
     const frontFace = card3d.createDiv("crisp-recall-card-face crisp-recall-card-face--front");
     const frontTag = frontFace.createDiv("crisp-recall-card__type-tag");
     frontTag.createSpan({ text: `💡 ${currentCard.typeName}` });
-    frontFace.createDiv({ cls: "crisp-recall-card__content", text: currentCard.prompt });
+    renderRecallCardContent(frontFace.createDiv("crisp-recall-card__content"), currentCard.prompt);
     frontFace.createDiv({ cls: "crisp-recall-card__flip-hint", text: "点击卡片或按 [Space] 查看答案" });
 
     // Back Face (Answer)
     const backFace = card3d.createDiv("crisp-recall-card-face crisp-recall-card-face--back");
     const backTag = backFace.createDiv("crisp-recall-card__type-tag");
     backTag.createSpan({ text: "✅ 答案解析" });
-    backFace.createDiv({ cls: "crisp-recall-card__content", text: currentCard.answer });
+    renderRecallCardContent(backFace.createDiv("crisp-recall-card__content"), currentCard.answer);
     backFace.createDiv({ cls: "crisp-recall-card__flip-hint", text: "请评估你的记忆掌握程度 (按 1 / 2 / 3)" });
 
     // 3. Bottom Footer Actions
@@ -1750,6 +1923,13 @@ class CrispRecallPlugin extends Plugin {
         cardLine.classList.remove("crisp-recall-card-line");
       });
 
+      doc.querySelectorAll(".crisp-recall-math").forEach((mathEl) => {
+        const originalHtml = mathEl.dataset.crispRecallOriginalHtml;
+        if (originalHtml !== undefined) mathEl.innerHTML = originalHtml;
+        delete mathEl.dataset.crispRecallOriginalHtml;
+        mathEl.classList.remove("crisp-recall-math");
+      });
+
       doc.querySelectorAll(".crisp-recall-cloze").forEach((cloze) => {
         cloze.classList.remove("crisp-recall-cloze", "is-revealed");
         if (cloze.title === "单击遮罩 / 翻转揭晓") cloze.removeAttribute("title");
@@ -1875,6 +2055,8 @@ class CrispRecallPlugin extends Plugin {
       });
     }
 
+    this.renderMathCards(element, context);
+
     // Floating Pill Widget at bottom-right of preview view
     if (this.settings.enableFloatingPill) {
       if (this.app.workspace?.getLeavesOfType) {
@@ -1927,6 +2109,69 @@ class CrispRecallPlugin extends Plugin {
       promptSpan.textContent = prompt;
       answerSpan.textContent = answer;
     }
+    return true;
+  }
+
+  // Formulas: a math block that answers the "Question ::" line above it is masked whole, and each
+  // ==target== written inside a formula is typeset as its own mask.
+  renderMathCards(element, context) {
+    element.querySelectorAll(".math").forEach((mathEl) => {
+      if (mathEl.classList.contains("crisp-recall-math") || mathEl.closest(".crisp-ann")) return;
+      const latex = mathEl.querySelector("mjx-math")?.getAttribute("data-latex") || "";
+      const isBlock = mathEl.classList.contains("math-block");
+      const isAnswer = this.settings.enableDoubleColon && isBlock && this.isMathBlockAnswer(mathEl, element, context);
+      if (isAnswer) {
+        mathEl.classList.add("crisp-recall-math", "crisp-recall-cloze");
+        mathEl.title = "单击遮罩 / 翻转揭晓";
+      }
+      if (findMathClozes(latex).length === 0) return;
+      // A formula that is already one whole answer shows its markers as plain formula text.
+      const insideAnswer = isAnswer || !!mathEl.closest(".crisp-recall-card-line__answer");
+      if (!insideAnswer && !this.settings.enableCloze) return;
+      const source = insideAnswer
+        ? unwrapMathClozes(latex)
+        // MathJax only keeps classes that start with "mjx-".
+        : replaceMathClozes(latex, (target) => `\\class{mjx-crisp-recall-cloze}{${target}}`);
+      if (!this.typesetRecallMath(mathEl, source, isBlock)) return;
+      mathEl.querySelectorAll(".mjx-crisp-recall-cloze").forEach((mask) => {
+        mask.classList.add("crisp-recall-cloze");
+        mask.setAttribute("title", "单击遮罩 / 翻转揭晓");
+      });
+    });
+  }
+
+  isMathBlockAnswer(mathEl, element, context) {
+    // A one-line $$formula$$ under "Question ::" shares its paragraph, after a soft break.
+    let node = mathEl.previousSibling;
+    while (node?.nodeType === 3 && !node.nodeValue.trim()) node = node.previousSibling;
+    if (node?.nodeName === "BR") {
+      let text = "";
+      for (let prev = node.previousSibling; prev && prev.nodeName !== "BR"; prev = prev.previousSibling) {
+        text = prev.textContent + text;
+      }
+      return !!parseMathQuestionLine(text);
+    }
+    // A multi-line math block is a section of its own; the question is the source line above it.
+    if (node || mathEl.parentElement !== element) return false;
+    const info = context?.getSectionInfo?.(element);
+    if (!info || !(info.lineStart > 0)) return false;
+    return !!parseMathQuestionLine(info.text.split("\n")[info.lineStart - 1]);
+  }
+
+  typesetRecallMath(mathEl, source, display) {
+    if (typeof renderMath !== "function") return false;
+    let rendered;
+    try {
+      rendered = renderMath(source, display);
+    } catch (error) {
+      console.debug("Crisp Recall could not typeset a formula:", error);
+      return false;
+    }
+    if (!rendered) return false;
+    mathEl.dataset.crispRecallOriginalHtml = mathEl.innerHTML;
+    mathEl.classList.add("crisp-recall-math");
+    mathEl.replaceChildren(rendered);
+    if (typeof finishRenderMath === "function") Promise.resolve(finishRenderMath()).catch(() => {});
     return true;
   }
 

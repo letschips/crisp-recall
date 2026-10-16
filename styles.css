@@ -51,6 +51,25 @@
   cursor: pointer;
 }
 
+/* Formulas: a whole math block answering a question, or one part of a formula. */
+.math-block.crisp-recall-cloze {
+  display: block;
+  width: fit-content;
+  max-width: 100%;
+  margin: 0.5em auto;
+  padding: 2px 12px;
+}
+
+.math-block.crisp-recall-cloze > mjx-container[display="true"] {
+  margin: 0.3em 0;
+}
+
+mjx-container .crisp-recall-cloze {
+  margin: 0 1px;
+  padding: 0 3px;
+  font-weight: inherit;
+}
+
 /* Double-Colon Concept / Definition Card in Reading View */
 .crisp-recall-card-line {
   position: relative;
