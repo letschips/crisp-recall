@@ -1697,8 +1697,8 @@ test("review cards render their formulas and keep the surrounding text", () => {
   assert.deepEqual(parts, ["能量 ", "E\\boxed{?}", " 守恒"]);
 });
 
-function mathHtml(latex, tag = "div", cls = "math math-block") {
-  return `<${tag} class="${cls} is-loaded"><mjx-container class="MathJax"><mjx-math data-latex="${latex}">rendered</mjx-math></mjx-container></${tag}>`;
+function mathHtml(latex, tag = "div", cls = "math math-block", text = "rendered") {
+  return `<${tag} class="${cls} is-loaded"><mjx-container class="MathJax"><mjx-math data-latex="${latex}">${text}</mjx-math></mjx-container></${tag}>`;
 }
 
 function mathReadingSetup(bodyHtml) {
@@ -1721,8 +1721,8 @@ test("reading view masks clozes written inside a formula and restores it on unlo
   plugin.processMarkdownView(root, {});
   plugin.processMarkdownView(root, {});
 
-  assert.deepEqual(calls, [["\\class{mjx-crisp-recall-cloze}{e^{i\\pi}}+1=0", true]]);
-  const mask = root.querySelector(".mjx-crisp-recall-cloze");
+  assert.deepEqual(calls, [["\\class{mjx-crisp-recall-cloze-0}{e^{i\\pi}}+1=0", true]]);
+  const mask = root.querySelector(".mjx-crisp-recall-cloze-0");
   assert.ok(mask.classList.contains("crisp-recall-cloze"));
 
   plugin.onunload();
@@ -1738,7 +1738,7 @@ test("reading view masks a math block that answers the question line above it", 
   assert.ok(block.classList.contains("crisp-recall-cloze"));
   // The whole formula is the answer, so markers inside it render as plain formula text.
   assert.deepEqual(answered.calls, [["e+1", true]]);
-  assert.equal(answered.root.querySelector(".mjx-crisp-recall-cloze"), null);
+  assert.equal(answered.root.querySelector("[class*='mjx-crisp-recall-cloze']"), null);
 
   const plain = mathReadingSetup(mathHtml("x^2"));
   plain.plugin.processMarkdownView(plain.root, sectionInfo("Just text\n$$\nx^2\n$$", 1));
@@ -1750,4 +1750,118 @@ test("reading view masks a math block that answers the question line above it", 
   soft.plugin.processMarkdownView(soft.root, {});
   assert.ok(soft.root.querySelector(".math-block").classList.contains("crisp-recall-cloze"));
   assert.equal(soft.root.querySelector(".crisp-recall-card-line"), null);
+});
+
+test("formula clozes keep an adjacent = and drop markers from formula answers", () => {
+  const { parseFlashcardsFromText } = loadPlugin();
+  const cards = parseFlashcardsFromText([
+    "$E===mc^2==$",
+    "$==mc^2===E$",
+    "平方 :: $==x^2==$",
+  ].join("\n"));
+
+  assert.deepEqual(cardPairs(cards), [
+    ["$E=\\boxed{\\,?\\,}$", "$mc^2$"],
+    ["$\\boxed{\\,?\\,}=E$", "$mc^2$"],
+    ["平方", "$x^2$"],
+  ]);
+});
+
+test("formula cards inside blockquotes and callouts are found", () => {
+  const { parseFlashcardsFromText } = loadPlugin();
+  const cards = parseFlashcardsFromText([
+    "> 公式 ::",
+    "> $$",
+    "> E=mc^2",
+    "> $$",
+    "",
+    "> [!note]",
+    "> $$",
+    "> ==x^2==",
+    "> $$",
+  ].join("\n"));
+
+  assert.deepEqual(cardPairs(cards), [
+    ["公式", "$$E=mc^2$$"],
+    ["$$\\boxed{\\,?\\,}$$", "$$x^2$$"],
+  ]);
+});
+
+test("a cloze across & or \\\\ keeps the formula's alignment intact", () => {
+  const { parseFlashcardsFromText } = loadPlugin();
+  const cards = parseFlashcardsFromText([
+    "$$",
+    "\\begin{pmatrix}",
+    "==a & b==\\\\",
+    "c & d",
+    "\\end{pmatrix}",
+    "$$",
+  ].join("\n"));
+
+  assert.deepEqual(cardPairs(cards), [[
+    "$$\\begin{pmatrix}\n\\boxed{\\,?\\,} & \\boxed{\\,?\\,}\\\\\nc & d\n\\end{pmatrix}$$",
+    "$$\\begin{matrix}a & b\\end{matrix}$$",
+  ]]);
+});
+
+test("Cloze selection of a whole math environment wraps it as one cloze and toggles back", () => {
+  const { PluginClass, parseFlashcardsFromText } = loadPlugin();
+  const block = "$$\n\\begin{aligned}\na&=b\\\\\nc&=d\n\\end{aligned}\n$$";
+  const wrapped = "$$\n==\\begin{aligned}\na&=b\\\\\nc&=d\n\\end{aligned}==\n$$";
+  let selection = block;
+  const editor = {
+    getSelection: () => selection,
+    replaceSelection(value) { selection = value; },
+    focus() {},
+  };
+  const plugin = new PluginClass();
+  plugin.licenseState = { valid: true, payload: { product: "Crisp Suite" } };
+
+  plugin.handleSelectionAction("cloze", editor);
+  assert.equal(selection, wrapped);
+  assert.deepEqual(cardPairs(parseFlashcardsFromText(selection)), [
+    ["$$\\boxed{\\,?\\,}$$", "$$\\begin{aligned}\na&=b\\\\\nc&=d\n\\end{aligned}$$"],
+  ]);
+
+  plugin.handleSelectionAction("cloze", editor);
+  assert.equal(selection, block);
+});
+
+test("reading view never splits a card at :: inside a formula", () => {
+  // MathJax keeps the formula's own characters as text, so "::" shows up in textContent.
+  const inline = (latex) => mathHtml(latex, "span", "math math-inline", latex);
+  const { root, plugin } = mathReadingSetup(
+    `<p>${inline("a::b")} 只是公式</p><p>${inline("a::b")} :: 关系</p>`,
+  );
+
+  plugin.processMarkdownView(root, {});
+
+  assert.deepEqual(cardLineSummary(root), [{ prompt: "a::b", answer: "关系" }]);
+  assert.ok(root.querySelector(".crisp-recall-card-line__prompt .math"), "the formula stays whole in the prompt");
+});
+
+test("reading view masks each aligned part of a formula cloze and reveals them together", () => {
+  const { dom, root, calls, plugin } = mathReadingSetup(mathHtml("\\begin{pmatrix}==a & b==\\\\c & d\\end{pmatrix}"));
+
+  plugin.processMarkdownView(root, {});
+
+  assert.deepEqual(calls, [[
+    "\\begin{pmatrix}\\class{mjx-crisp-recall-cloze-0}{a} & \\class{mjx-crisp-recall-cloze-0}{b}\\\\c & d\\end{pmatrix}",
+    true,
+  ]]);
+  const masks = root.querySelectorAll(".crisp-recall-cloze");
+  assert.equal(masks.length, 2);
+  const event = new dom.window.MouseEvent("click", { bubbles: true, cancelable: true });
+  Object.defineProperty(event, "target", { value: masks[1] });
+  plugin.handleClozeClick(event);
+  assert.ok(Array.from(masks).every((mask) => mask.classList.contains("is-revealed")));
+});
+
+test("reading view masks a math block answering a question inside a blockquote", () => {
+  const { root, plugin } = mathReadingSetup(`<blockquote><p>公式 ::</p>${mathHtml("E=mc^2")}</blockquote>`);
+  const text = "> 公式 ::\n> $$\n> E=mc^2\n> $$";
+
+  plugin.processMarkdownView(root, { getSectionInfo: () => ({ text, lineStart: 0, lineEnd: 3 }) });
+
+  assert.ok(root.querySelector(".math-block").classList.contains("crisp-recall-cloze"));
 });

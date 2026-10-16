@@ -344,9 +344,63 @@ function maskMath(text) {
   return masked.join("");
 }
 
-// ==target== written inside a formula marks a cloze; the target itself may contain "=".
-const MATH_CLOZE_PATTERN = /==((?:(?!==)[\s\S])+?)==/g;
+// ==target== written inside a formula marks a cloze; the target itself may contain "=". In "E===mc^2=="
+// the first "=" belongs to the formula, so a cloze never starts with "=".
+const MATH_CLOZE_PATTERN = /==(?!=)((?:(?!==)[\s\S])+?)==/g;
 const MATH_CLOZE_BLANK = "\\boxed{\\,?\\,}";
+
+// Splits LaTeX at its top-level & and \\ (outside braces and environments). Even indexes hold content and
+// odd indexes the separators, which must stay outside any group for a matrix or alignment to typeset.
+function splitMathAlignment(latex) {
+  const parts = [];
+  let braces = 0;
+  let environments = 0;
+  let start = 0;
+  for (let i = 0; i < latex.length; i++) {
+    const topLevel = braces === 0 && environments === 0;
+    if (latex[i] === "\\") {
+      if (latex[i + 1] === "\\" && topLevel) {
+        parts.push(latex.slice(start, i), "\\\\");
+        start = i + 2;
+      } else if (latex.startsWith("\\begin{", i)) environments++;
+      else if (latex.startsWith("\\end{", i)) environments = Math.max(0, environments - 1);
+      i++;
+    } else if (latex[i] === "{") braces++;
+    else if (latex[i] === "}") braces = Math.max(0, braces - 1);
+    else if (latex[i] === "&" && topLevel) {
+      parts.push(latex.slice(start, i), "&");
+      start = i + 1;
+    }
+  }
+  parts.push(latex.slice(start));
+  return parts;
+}
+
+// Applies wrap(content) to every aligned part of a cloze target, keeping & and \\ between the parts.
+function wrapMathClozeParts(target, wrap) {
+  return splitMathAlignment(target).map((part, index) => {
+    if (index % 2 === 1 || !part.trim()) return part;
+    const [, lead, content, trail] = part.match(/^(\s*)([\s\S]*?)(\s*)$/);
+    return `${lead}${wrap(content)}${trail}`;
+  }).join("");
+}
+
+// A cloze answer typesets on its own, so aligned parts need an environment of their own.
+function mathClozeAnswer(target) {
+  const latex = target.trim();
+  return splitMathAlignment(latex).length > 1 ? `\\begin{matrix}${latex}\\end{matrix}` : latex;
+}
+
+// Removes cloze markers from every formula in a line of Markdown.
+function unwrapLineMathClozes(text) {
+  let output = "";
+  let index = 0;
+  for (const range of findMathRanges(maskInlineCode(text))) {
+    output += text.slice(index, range.contentStart) + unwrapMathClozes(text.slice(range.contentStart, range.contentEnd));
+    index = range.contentEnd;
+  }
+  return output + text.slice(index);
+}
 
 function findMathClozes(latex) {
   return Array.from(latex.matchAll(MATH_CLOZE_PATTERN)).filter((match) => match[1].trim());
@@ -361,6 +415,15 @@ function replaceMathClozes(latex, replacer) {
 }
 
 const unwrapMathClozes = (latex) => replaceMathClozes(latex, (target) => target);
+
+// The formula with one cloze blanked out and the others shown as written.
+function blankMathCloze(latex, clozeIndex) {
+  return replaceMathClozes(latex, (target, k) => (
+    k === clozeIndex ? wrapMathClozeParts(target, () => MATH_CLOZE_BLANK) : target
+  ));
+}
+
+const stripQuoteMarkers = (text) => text.replace(/^(?:>\s*)+/, "");
 
 function maskCrispAnnotationDirectives(text) {
   return text.replace(
@@ -432,6 +495,24 @@ function formatClozeSelection(selection) {
       };
     });
   const eligibleLines = lines.filter((line) => line.eligible);
+  // Lines of a formula are one formula: wrapping each line would split an environment such as aligned.
+  const isFormula = lines.some((line) => line.body === "$$" || /^\\(?:begin|end)\{/.test(line.body));
+  if (isFormula && eligibleLines.length > 0) {
+    const first = eligibleLines[0];
+    const last = eligibleLines[eligibleLines.length - 1];
+    const unwrapFormula = first.body.startsWith("==") && last.body.endsWith("==")
+      && (first !== last || first.wrapped);
+    let lineIndex = 0;
+    return chunks.map((chunk, index) => {
+      if (index % 2 === 1) return chunk;
+      const line = lines[lineIndex++];
+      if (line !== first && line !== last) return chunk;
+      let body = line.body;
+      if (line === first) body = unwrapFormula ? body.slice(2) : `==${body}`;
+      if (line === last) body = unwrapFormula ? body.slice(0, -2) : `${body}==`;
+      return `${line.prefix}${body}${line.suffix}`;
+    }).join("");
+  }
   const unwrap = eligibleLines.length > 0 && eligibleLines.every((line) => line.wrapped);
   let lineIndex = 0;
 
@@ -461,8 +542,11 @@ function findDoubleColonSeparator(searchableLine) {
   };
 }
 
-function parseDoubleColonLine(line, { allowEmptyAnswer = false } = {}) {
-  const separatorInfo = findDoubleColonSeparator(maskMath(maskCrispAnnotationDirectives(maskInlineCode(line))));
+// `searchable` is the rendered line with its formulas blanked out (see renderedCardText).
+function parseDoubleColonLine(line, { allowEmptyAnswer = false, searchable } = {}) {
+  const separatorInfo = findDoubleColonSeparator(searchable === undefined
+    ? maskMath(maskCrispAnnotationDirectives(maskInlineCode(line)))
+    : maskCrispAnnotationDirectives(maskInlineCode(searchable)));
   if (!separatorInfo) return null;
 
   const prompt = stripCardPrefix(stripCrispAnnotationDirectives(line.slice(0, separatorInfo.index)));
@@ -482,13 +566,58 @@ function parseMathQuestionLine(line) {
   return card && !card.answer ? card : null;
 }
 
+// For each math block a section renders, in order: whether it answers the "Question ::" line right above
+// it, read from the section's source as the review parser reads it. Null without source lines.
+function mathBlockAnswerFlags(info) {
+  if (!info?.text) return null;
+  const lines = info.text.split("\n");
+  const flags = [];
+  let inBlock = false;
+  for (let i = info.lineStart; i <= info.lineEnd && i < lines.length; i++) {
+    const line = stripQuoteMarkers(lines[i].trim());
+    if (inBlock) {
+      if (line.endsWith("$$")) inBlock = false;
+      continue;
+    }
+    if (line.startsWith("$$")) {
+      flags.push(!!parseMathQuestionLine(lines[i - 1]));
+      const rest = line.slice(2);
+      inBlock = !(rest.length >= 2 && rest.endsWith("$$"));
+      continue;
+    }
+    for (const range of findMathRanges(maskInlineCode(line))) {
+      if (range.display) flags.push(false);
+    }
+  }
+  return flags;
+}
+
+// Without source lines: a one-line $$formula$$ under "Question ::" shares its paragraph after a soft break.
+function isSoftBreakMathAnswer(mathEl) {
+  let node = mathEl.previousSibling;
+  while (node?.nodeType === 3 && !node.nodeValue.trim()) node = node.previousSibling;
+  if (node?.nodeName !== "BR") return false;
+  let text = "";
+  for (let prev = node.previousSibling; prev && prev.nodeName !== "BR"; prev = prev.previousSibling) {
+    text = prev.textContent + text;
+  }
+  return !!parseMathQuestionLine(text);
+}
+
+function restoreRecallMath(mathEl) {
+  const originalHtml = mathEl.dataset.crispRecallOriginalHtml;
+  if (originalHtml !== undefined) mathEl.innerHTML = originalHtml;
+  delete mathEl.dataset.crispRecallOriginalHtml;
+  mathEl.classList.remove("crisp-recall-math");
+}
+
 // Splits a rendered "prompt :: answer" paragraph or list item around the separator while keeping its
 // links, emphasis and highlights. List bullets and task checkboxes stay in place. Returns null when the
 // DOM cannot be split, and the caller falls back to plain text.
-function extractCardLineParts(el, text) {
+function extractCardLineParts(el, searchable) {
   const doc = el.ownerDocument;
   if (!doc?.createRange || !doc.createTreeWalker || !el.lastChild) return null;
-  const separatorInfo = findDoubleColonSeparator(maskCrispAnnotationDirectives(maskInlineCode(text)));
+  const separatorInfo = findDoubleColonSeparator(maskCrispAnnotationDirectives(maskInlineCode(searchable)));
   if (!separatorInfo) return null;
 
   const separatorStart = separatorInfo.index;
@@ -525,6 +654,32 @@ function extractCardLineParts(el, text) {
   promptRange.setStartBefore(firstContent);
   promptRange.setEndAfter(el.lastChild);
   return { prompt: promptRange.extractContents(), answer };
+}
+
+// The text of rendered nodes, and a copy of the same length with formula glyphs blanked so that "::"
+// inside a formula is never taken for a card separator.
+function renderedCardText(nodes) {
+  let text = "";
+  let searchable = "";
+  const add = (textNode) => {
+    const value = textNode.nodeValue;
+    text += value;
+    searchable += textNode.parentElement?.closest?.(".math") ? " ".repeat(value.length) : value;
+  };
+  for (const node of nodes) {
+    if (node.nodeType === 3) {
+      add(node);
+      continue;
+    }
+    const walker = node.ownerDocument?.createTreeWalker?.(node, 4 /* NodeFilter.SHOW_TEXT */);
+    if (!walker) {
+      text += node.textContent || "";
+      searchable += node.textContent || "";
+      continue;
+    }
+    for (let textNode = walker.nextNode(); textNode; textNode = walker.nextNode()) add(textNode);
+  }
+  return { text, searchable };
 }
 
 function trimEdgeWhitespace(el) {
@@ -585,13 +740,12 @@ function parseFlashcardsFromText(text, filePath = "", options = {}) {
     }
     if (!enableCloze) return;
     findMathClozes(latex).forEach((match, clozeIndex) => {
-      const blanked = replaceMathClozes(latex, (target, k) => (k === clozeIndex ? MATH_CLOZE_BLANK : target));
       cards.push({
         id: `${filePath}:${block.line}:cloze:${clozeIndex + 1}`,
         type: "cloze",
         typeName: "挖空填空卡",
-        prompt: `$$${blanked}$$`,
-        answer: `$$${match[1].trim()}$$`,
+        prompt: `$$${blankMathCloze(latex, clozeIndex)}$$`,
+        answer: `$$${mathClozeAnswer(match[1])}$$`,
         line: block.line,
         filePath: filePath,
       });
@@ -626,17 +780,19 @@ function parseFlashcardsFromText(text, filePath = "", options = {}) {
     }
     if (fence) continue;
 
+    // Math blocks may sit in a blockquote or callout, behind ">" markers.
+    const mathLine = stripQuoteMarkers(line);
     if (mathBlock) {
-      const closes = line.endsWith("$$");
-      mathBlock.lines.push(closes ? line.slice(0, -2) : line);
+      const closes = mathLine.endsWith("$$");
+      mathBlock.lines.push(closes ? mathLine.slice(0, -2) : mathLine);
       if (closes) {
         emitMathBlock(mathBlock);
         mathBlock = null;
       }
       continue;
     }
-    if (line.startsWith("$$")) {
-      const rest = line.slice(2);
+    if (mathLine.startsWith("$$")) {
+      const rest = mathLine.slice(2);
       const closes = rest.length >= 2 && rest.endsWith("$$");
       mathBlock = { line: i, lines: [closes ? rest.slice(0, -2) : rest] };
       if (closes) {
@@ -654,7 +810,7 @@ function parseFlashcardsFromText(text, filePath = "", options = {}) {
     const searchableLine = maskMath(codeMaskedLine);
 
     // 1. Double colon cards: "Prompt :: Answer" or "Prompt ::: Answer"
-    if (enableDoubleColon && (lines[i + 1] || "").trim().startsWith("$$")) {
+    if (enableDoubleColon && stripQuoteMarkers((lines[i + 1] || "").trim()).startsWith("$$")) {
       const question = parseMathQuestionLine(line);
       if (question) {
         mathQuestion = { ...question, line: i };
@@ -663,7 +819,12 @@ function parseFlashcardsFromText(text, filePath = "", options = {}) {
     }
     const doubleColonCard = enableDoubleColon ? parseDoubleColonLine(line) : null;
     if (doubleColonCard) {
-      pushConceptCards(doubleColonCard, i);
+      // A formula answer is one whole answer; markers inside it are not clozes of their own.
+      pushConceptCards({
+        ...doubleColonCard,
+        prompt: unwrapLineMathClozes(doubleColonCard.prompt),
+        answer: unwrapLineMathClozes(doubleColonCard.answer),
+      }, i);
       continue;
     }
 
@@ -709,11 +870,11 @@ function parseFlashcardsFromText(text, filePath = "", options = {}) {
       const latex = line.slice(range.contentStart, range.contentEnd);
       const delimiter = range.display ? "$$" : "$";
       findMathClozes(latex).forEach((mathMatch, clozeIndex) => {
-        const blanked = replaceMathClozes(latex, (target, k) => (k === clozeIndex ? MATH_CLOZE_BLANK : target));
+        const blanked = blankMathCloze(latex, clozeIndex);
         clozes.push({
           index: range.contentStart + mathMatch.index,
           prompt: `${line.slice(0, range.contentStart)}${blanked}${line.slice(range.contentEnd)}`,
-          answer: `${delimiter}${mathMatch[1].trim()}${delimiter}`,
+          answer: `${delimiter}${mathClozeAnswer(mathMatch[1])}${delimiter}`,
         });
       });
     }
@@ -1662,6 +1823,13 @@ class CrispRecallPlugin extends Plugin {
     event.preventDefault();
     event.stopPropagation();
     cloze.classList.toggle("is-revealed");
+    // The parts of one formula cloze, split around & or \\, reveal together.
+    const group = cloze.dataset?.crispRecallGroup;
+    if (group) {
+      const revealed = cloze.classList.contains("is-revealed");
+      cloze.closest(".crisp-recall-math")?.querySelectorAll(`[data-crisp-recall-group="${group}"]`)
+        .forEach((part) => part.classList.toggle("is-revealed", revealed));
+    }
   }
 
   detachSelectionDocument(doc) {
@@ -1923,12 +2091,7 @@ class CrispRecallPlugin extends Plugin {
         cardLine.classList.remove("crisp-recall-card-line");
       });
 
-      doc.querySelectorAll(".crisp-recall-math").forEach((mathEl) => {
-        const originalHtml = mathEl.dataset.crispRecallOriginalHtml;
-        if (originalHtml !== undefined) mathEl.innerHTML = originalHtml;
-        delete mathEl.dataset.crispRecallOriginalHtml;
-        mathEl.classList.remove("crisp-recall-math");
-      });
+      doc.querySelectorAll(".crisp-recall-math").forEach(restoreRecallMath);
 
       doc.querySelectorAll(".crisp-recall-cloze").forEach((cloze) => {
         cloze.classList.remove("crisp-recall-cloze", "is-revealed");
@@ -2080,12 +2243,13 @@ class CrispRecallPlugin extends Plugin {
       || el.querySelector(".crisp-ann__target")
       || maskCrispAnnotationDirectives(text) !== text;
     if (alreadyProcessed || containsCode || containsNestedList || containsAnnotation) return false;
-    const card = parseDoubleColonLine(text);
+    const { searchable } = renderedCardText([el]);
+    const card = parseDoubleColonLine(text, { searchable });
     if (!card) return false;
     const { prompt, answer } = card;
 
     el.dataset.crispRecallOriginalHtml = el.innerHTML;
-    const parts = extractCardLineParts(el, text);
+    const parts = extractCardLineParts(el, searchable);
     if (!parts) el.empty();
     el.addClass("crisp-recall-card-line");
 
@@ -2115,47 +2279,42 @@ class CrispRecallPlugin extends Plugin {
   // Formulas: a math block that answers the "Question ::" line above it is masked whole, and each
   // ==target== written inside a formula is typeset as its own mask.
   renderMathCards(element, context) {
+    const blocks = Array.from(element.querySelectorAll(".math-block"));
+    const answerFlags = mathBlockAnswerFlags(context?.getSectionInfo?.(element));
+    const useFlags = answerFlags?.length === blocks.length;
     element.querySelectorAll(".math").forEach((mathEl) => {
-      if (mathEl.classList.contains("crisp-recall-math") || mathEl.closest(".crisp-ann")) return;
-      const latex = mathEl.querySelector("mjx-math")?.getAttribute("data-latex") || "";
+      if (mathEl.classList.contains("crisp-recall-cloze") || mathEl.closest(".crisp-ann")) return;
       const isBlock = mathEl.classList.contains("math-block");
-      const isAnswer = this.settings.enableDoubleColon && isBlock && this.isMathBlockAnswer(mathEl, element, context);
+      const isAnswer = this.settings.enableDoubleColon && isBlock
+        && (useFlags ? answerFlags[blocks.indexOf(mathEl)] : isSoftBreakMathAnswer(mathEl));
+      if (mathEl.classList.contains("crisp-recall-math")) {
+        // Callout content is rendered on its own before its section, which alone knows the source lines.
+        if (!isAnswer) return;
+        restoreRecallMath(mathEl);
+      }
       if (isAnswer) {
         mathEl.classList.add("crisp-recall-math", "crisp-recall-cloze");
         mathEl.title = "单击遮罩 / 翻转揭晓";
       }
+      const latex = mathEl.querySelector("mjx-math")?.getAttribute("data-latex") || "";
       if (findMathClozes(latex).length === 0) return;
       // A formula that is already one whole answer shows its markers as plain formula text.
       const insideAnswer = isAnswer || !!mathEl.closest(".crisp-recall-card-line__answer");
       if (!insideAnswer && !this.settings.enableCloze) return;
       const source = insideAnswer
         ? unwrapMathClozes(latex)
-        // MathJax only keeps classes that start with "mjx-".
-        : replaceMathClozes(latex, (target) => `\\class{mjx-crisp-recall-cloze}{${target}}`);
+        // MathJax only keeps classes that start with "mjx-". Parts split around & or \\ share a group.
+        : replaceMathClozes(latex, (target, group) => wrapMathClozeParts(
+          target,
+          (part) => `\\class{mjx-crisp-recall-cloze-${group}}{${part}}`,
+        ));
       if (!this.typesetRecallMath(mathEl, source, isBlock)) return;
-      mathEl.querySelectorAll(".mjx-crisp-recall-cloze").forEach((mask) => {
+      mathEl.querySelectorAll("[class*='mjx-crisp-recall-cloze-']").forEach((mask) => {
         mask.classList.add("crisp-recall-cloze");
+        mask.dataset.crispRecallGroup = mask.getAttribute("class").match(/mjx-crisp-recall-cloze-(\d+)/)?.[1] || "";
         mask.setAttribute("title", "单击遮罩 / 翻转揭晓");
       });
     });
-  }
-
-  isMathBlockAnswer(mathEl, element, context) {
-    // A one-line $$formula$$ under "Question ::" shares its paragraph, after a soft break.
-    let node = mathEl.previousSibling;
-    while (node?.nodeType === 3 && !node.nodeValue.trim()) node = node.previousSibling;
-    if (node?.nodeName === "BR") {
-      let text = "";
-      for (let prev = node.previousSibling; prev && prev.nodeName !== "BR"; prev = prev.previousSibling) {
-        text = prev.textContent + text;
-      }
-      return !!parseMathQuestionLine(text);
-    }
-    // A multi-line math block is a section of its own; the question is the source line above it.
-    if (node || mathEl.parentElement !== element) return false;
-    const info = context?.getSectionInfo?.(element);
-    if (!info || !(info.lineStart > 0)) return false;
-    return !!parseMathQuestionLine(info.text.split("\n")[info.lineStart - 1]);
   }
 
   typesetRecallMath(mathEl, source, display) {
@@ -2193,8 +2352,8 @@ class CrispRecallPlugin extends Plugin {
     const originalHtml = el.innerHTML;
     let changed = false;
     for (const line of lines) {
-      const text = line.map((node) => node.textContent).join("");
-      if (!parseDoubleColonLine(text)) continue;
+      const { text, searchable } = renderedCardText(line);
+      if (!parseDoubleColonLine(text, { searchable })) continue;
       const wrapper = el.ownerDocument.createElement("span");
       el.insertBefore(wrapper, line[0]);
       wrapper.append(...line);
