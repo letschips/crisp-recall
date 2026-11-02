@@ -2614,7 +2614,9 @@ class CrispRecallSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    containerEl.createEl("h2", { text: "⚡ Crisp Recall 设置" });
+    const brandHeader = containerEl.createDiv({ cls: "crisp-brand-header" });
+    brandHeader.createEl("h2", { text: "Crisp Recall" });
+    containerEl.createEl("p", { text: "读过的，再记一遍", cls: "crisp-brand-slogan" });
 
     const licenseState = this.plugin.licenseState || { valid: false, reason: "尚未输入 Crisp 授权码" };
     const statusSetting = new Setting(containerEl).setName("激活状态");
