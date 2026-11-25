@@ -105,6 +105,17 @@ function resolveRecallLicensePermission(payload) {
   };
 }
 
+/**
+ * Chat apps mangle long codes when they are copied: line breaks, spaces (incl. full-width/NBSP),
+ * zero-width characters, and surrounding text such as "卡密：…。". Returns the bare code.
+ */
+function normalizeLicenseCode(input) {
+  if (typeof input !== "string") return "";
+  const compact = input.replace(/[\s\u200B-\u200D\u2060\uFEFF]/g, "");
+  const match = compact.match(/[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}/);
+  return match ? match[0] : compact;
+}
+
 // 库内其它 Crisp 插件保存的授权码，按磁盘上的目录顺序去重收集（不含 Recall 自己）。
 function collectVaultCrispLicenseCandidates(app) {
   const candidates = [];
@@ -122,7 +133,7 @@ function collectVaultCrispLicenseCandidates(app) {
       if (!fs.existsSync(dataPath)) continue;
       try {
         const data = JSON.parse(fs.readFileSync(dataPath, "utf-8"));
-        const code = typeof data?.licenseCode === "string" ? data.licenseCode.trim() : "";
+        const code = normalizeLicenseCode(data?.licenseCode);
         if (code.includes(".") && !seen.has(code)) {
           seen.add(code);
           candidates.push(code);
@@ -167,7 +178,7 @@ function getDeviceId() {
 }
 
 async function verifyCrispRecallLicense(licenseCode, options = {}) {
-  const trimmed = typeof licenseCode === "string" ? licenseCode.trim() : "";
+  const trimmed = normalizeLicenseCode(licenseCode);
   if (!trimmed) return { valid: false, reason: "授权码为空" };
 
   const parts = trimmed.split(".");
@@ -1584,9 +1595,7 @@ class CrispRecallPlugin extends Plugin {
     const storedSettings = await this.loadData();
     await this.protectUnreadableData(storedSettings);
     this.settings = Object.assign({}, DEFAULT_SETTINGS, storedSettings, {
-      licenseCode: typeof storedSettings?.licenseCode === "string"
-        ? storedSettings.licenseCode.trim()
-        : "",
+      licenseCode: normalizeLicenseCode(storedSettings?.licenseCode),
       clozeColor: typeof storedSettings?.clozeColor === "string"
         ? storedSettings.clozeColor.trim()
         : "",
@@ -2164,7 +2173,7 @@ class CrispRecallPlugin extends Plugin {
   }
 
   async activateLicense(licenseCode) {
-    this.settings.licenseCode = typeof licenseCode === "string" ? licenseCode.trim() : "";
+    this.settings.licenseCode = normalizeLicenseCode(licenseCode);
     const state = await this.refreshLicenseState({ online: true });
     await this.saveSettings();
     if (state.valid) this.refreshReadingViews();

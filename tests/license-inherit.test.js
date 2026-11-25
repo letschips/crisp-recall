@@ -25,7 +25,7 @@ function load() {
   const original = fs.readFileSync(mainPath, "utf8");
   const PEM_RE = /`-----BEGIN PUBLIC KEY-----[\s\S]*?-----END PUBLIC KEY-----`/;
   assert.ok(PEM_RE.test(original), "main.js 应内置一把公钥");
-  const source = `${original.replace(PEM_RE, "`" + pem + "`")}\nglobalThis.__t = { discoverVaultCrispLicense, verifyCrispRecallLicense };`;
+  const source = `${original.replace(PEM_RE, "`" + pem + "`")}\nglobalThis.__t = { normalizeLicenseCode, discoverVaultCrispLicense, verifyCrispRecallLicense };`;
   const module = { exports: {} };
   const quiet = { log() {}, warn() {}, error() {}, debug() {} };
   const obsidian = new Proxy({
@@ -110,4 +110,55 @@ test("只有无效候选时不写入设置、不保存，下次仍会重新扫�
 test("不扫描自己的 data.json", async (t) => {
   const app = makeVault(t, [[PLUGIN_ID, { licenseCode: code(["all"]) }]]);
   assert.equal(await lib.discoverVaultCrispLicense(app), null);
+});
+
+// ---------------------------------------------------------------------------
+// 粘贴规范化：聊天软件复制出来的卡密常带换行、空格、零宽字符和前后文字
+// ---------------------------------------------------------------------------
+function mangle(c) {
+  const mid = Math.floor(c.length / 2);
+  return `${c.slice(0, 10)}\n${c.slice(10, 30)}\r\n${c.slice(30, 50)} ${c.slice(50, 70)}\u3000${c.slice(70, 90)}\u200b${c.slice(90, mid)}\u00a0${c.slice(mid)}`;
+}
+
+test("规范化：夹杂换行、空格、全角空格、零宽字符的码与干净码等价且验签通过", async () => {
+  const good = code(["all"]);
+  assert.equal(lib.normalizeLicenseCode(mangle(good)), good);
+  const result = await lib.verifyCrispRecallLicense(mangle(good), { online: false });
+  assert.equal(result.valid, true, result.reason);
+});
+
+test("规范化：带「卡密：」前后缀与尾随文字的码有效，持久化并发给服务端的都是干净码", async (t) => {
+  const good = code(["all"]);
+  for (const pasted of [`卡密：${good}。`, `${good}\n复制卡密发送给买家`]) {
+    const bodies = [];
+    const request = async (req) => { bodies.push(JSON.parse(req.body)); return { status: 200, json: { valid: true } }; };
+    const direct = await lib.verifyCrispRecallLicense(pasted, { request });
+    assert.equal(direct.valid, true, direct.reason);
+    assert.equal(bodies[0].licenseCode, good, "发给服务端的是规范化后的码");
+
+    const plugin = makePlugin(makeVault(t, []));
+    const state = await plugin.activateLicense(pasted);
+    assert.equal(plugin.settings.licenseCode, good, "持久化的是规范化后的码");
+    assert.equal(plugin.saved.at(-1).licenseCode, good);
+    assert.equal(state.valid, true, state.reason);
+  }
+});
+
+test("规范化：垃圾输入和空字符串仍然无效，原因文字不变", async () => {
+  assert.equal(lib.normalizeLicenseCode(undefined), "");
+  assert.equal((await lib.verifyCrispRecallLicense("", {})).reason, "授权码为空");
+  assert.equal((await lib.verifyCrispRecallLicense(" \n\u200b ", {})).reason, "授权码为空");
+  assert.equal((await lib.verifyCrispRecallLicense("随便一段文字", {})).reason, "授权码格式无效（必须包含 payload 与签名）");
+  assert.equal((await lib.verifyCrispRecallLicense("abc.def", { online: false })).valid, false);
+});
+
+test("规范化：干净码原样不变", () => {
+  const good = code(["all"]);
+  assert.equal(lib.normalizeLicenseCode(good), good);
+});
+
+test("规范化：兄弟插件 data.json 里带空白的码也能被继承，并返回干净码", async (t) => {
+  const good = code(["all"]);
+  const app = makeVault(t, [["crisp-a", { licenseCode: `卡密：\n${good}\n` }]]);
+  assert.equal(await lib.discoverVaultCrispLicense(app), good);
 });
