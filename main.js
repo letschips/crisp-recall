@@ -133,10 +133,14 @@ function collectVaultCrispLicenseCandidates(app) {
       if (!fs.existsSync(dataPath)) continue;
       try {
         const data = JSON.parse(fs.readFileSync(dataPath, "utf-8"));
-        const code = normalizeLicenseCode(data?.licenseCode);
-        if (code.includes(".") && !seen.has(code)) {
-          seen.add(code);
-          candidates.push(code);
+        // Tempo saves `licenseKey`; Crisp Pulse keeps its settings nested under `settings`.
+        const raws = [data?.licenseCode || data?.licenseKey || data?.license, data?.settings?.licenseCode || data?.settings?.licenseKey];
+        for (const raw of raws) {
+          const code = normalizeLicenseCode(raw);
+          if (code.includes(".") && !seen.has(code)) {
+            seen.add(code);
+            candidates.push(code);
+          }
         }
       } catch (e) {}
     }
